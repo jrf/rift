@@ -402,16 +402,61 @@ fn cmd_kill(name: &str) -> i32 {
         Some(s) => s,
         None => { eprintln!("error: invalid socket path"); return 1; }
     };
-    let fd = match socket::session_connect(path_str) {
-        Ok(fd) => fd,
-        Err(e) => { eprintln!("error: cannot connect to session '{}': {}", name, e); return 1; }
+
+    // Probe first to get the pid for fallback SIGTERM
+    let pid = match ipc::probe_session(path_str) {
+        Ok(result) => {
+            let pid = result.info.pid;
+            // Reuse the probe connection to send kill
+            let _ = ipc::send(result.fd, Tag::Kill, &[]);
+            unsafe { libc::close(result.fd); }
+            Some(pid)
+        }
+        Err(_) => {
+            // Probe failed — try a plain connect + kill anyway
+            match socket::session_connect(path_str) {
+                Ok(fd) => {
+                    let _ = ipc::send(fd, Tag::Kill, &[]);
+                    unsafe { libc::close(fd); }
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::ConnectionRefused {
+                        // Dead socket, just clean it up
+                        socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
+                        return 0;
+                    }
+                    eprintln!("error: cannot connect to session '{}': {}", name, e);
+                    return 1;
+                }
+            }
+            None
+        }
     };
-    if let Err(e) = ipc::send(fd, Tag::Kill, &[]) {
-        eprintln!("error: failed to send kill: {}", e);
-        unsafe { libc::close(fd); }
-        return 1;
+
+    // Wait for socket to disappear
+    for _ in 0..5 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        match socket::session_exists(&cfg.socket_dir, &cfg.session_name) {
+            Ok(false) => return 0,
+            _ => {}
+        }
     }
-    unsafe { libc::close(fd); }
+
+    // Socket still exists — fall back to SIGTERM if we have a pid
+    if let Some(pid) = pid {
+        unsafe { libc::kill(pid, libc::SIGTERM); }
+        // Wait again for cleanup
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            match socket::session_exists(&cfg.socket_dir, &cfg.session_name) {
+                Ok(false) => return 0,
+                _ => {}
+            }
+        }
+    }
+
+    // Last resort — remove the socket manually
+    socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
     0
 }
 
