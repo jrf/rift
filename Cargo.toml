@@ -1,0 +1,11 @@
+[package]
+name = "ryx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+env_logger = "0.11.9"
+libc = "0.2.183"
+log = "0.4.29"
+nix = { version = "0.31.2", features = ["poll", "signal", "term", "fs", "net", "process"] }
+vt100 = "0.16.2"

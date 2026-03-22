@@ -1,0 +1,35 @@
+# ryx — Terminal session daemon
+
+## Now
+- [ ] `src/completions.rs` — Shell completion scripts (bash, zsh, fish) #feature
+
+## Next
+- [ ] wait (poll sessions for task completion) #feature
+
+## Later
+
+## Scrapped
+
+## Done
+- [x] Cargo project initialized with deps: nix, vt100, log, env_logger, libc #chore
+- [x] `src/ipc.rs` — IPC protocol (Tag enum, Header, send/recv, SocketBuffer, probe_session) #feature
+- [x] `src/socket.rs` — Unix socket creation/connection, session name validation, path management #feature
+- [x] `src/logger.rs` — File-based logging with 5MB rotation #feature
+- [x] `src/util.rs` — Shell quoting, DA responses, task exit markers, terminal serialization (vt100), session listing #feature
+- [x] `src/main.rs` — Core runtime: CLI, PTY spawning, daemon/client event loops, attach flow #feature
+
+## Key design decisions
+- Using `vt100` crate instead of ghostty-vt for terminal state tracking
+  - `Parser::new(rows, cols, scrollback)` / `parser.process(buf)`
+  - `screen().state_formatted()` for reattach serialization
+  - `screen().contents()` for plain history
+  - `screen().contents_formatted()` for VT history
+  - HTML history: need small custom formatter walking `screen().cell(row, col)`
+  - `screen_mut().set_size(rows, cols)` for resize
+- Using `nix` crate for POSIX APIs (poll, signals, sockets, termios)
+- Using `libc` crate for forkpty, ioctl
+- Binary IPC protocol is wire-compatible with zmx (1-byte tag + 4-byte LE length + payload)
+- Double-fork daemonization with ready pipe for parent synchronization
+- Self-pipe trick for integrating signals into poll() event loop
+- Box::leak for logger to satisfy `log::set_logger`'s `&'static` requirement
+- Detach key: Ctrl+\ (0x1c) plus Kitty protocol variant
