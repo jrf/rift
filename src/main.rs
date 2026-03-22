@@ -46,11 +46,12 @@ impl Cfg {
 // ---------------------------------------------------------------------------
 
 enum Command {
-    Attach { name: String },
+    Attach { name: String, detached: bool },
     List { short: bool },
     Run { name: String, cmd: Vec<String> },
     Kill { name: String },
     Detach { name: String },
+    History { name: String, format: util::HistoryFormat },
     Version,
     Help,
 }
@@ -93,12 +94,42 @@ fn parse_args() -> Command {
             let cmd = args[2..].to_vec();
             Command::Run { name, cmd }
         }
+        "history" | "hi" => {
+            let mut session_name: Option<String> = None;
+            let mut format = util::HistoryFormat::Plain;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--vt" => format = util::HistoryFormat::Vt,
+                    "--html" => format = util::HistoryFormat::Html,
+                    _ if session_name.is_none() => session_name = Some(arg.clone()),
+                    _ => {}
+                }
+            }
+            let name = session_name.unwrap_or_else(|| socket::session_name_from_env());
+            if name.is_empty() {
+                eprintln!("error: history requires a session name");
+                std::process::exit(1);
+            }
+            Command::History { name, format }
+        }
+        "new" => {
+            if args.len() < 2 {
+                eprintln!("error: new requires a session name");
+                std::process::exit(1);
+            }
+            Command::Attach { name: args[1].clone(), detached: true }
+        }
         "attach" => {
             if args.len() < 2 {
                 eprintln!("error: attach requires a session name");
                 std::process::exit(1);
             }
-            Command::Attach { name: args[1].clone() }
+            let detached = args.iter().any(|a| a == "-d" || a == "--detached");
+            let name = args[1..].iter()
+                .find(|a| !a.starts_with('-'))
+                .cloned()
+                .unwrap_or_else(|| { eprintln!("error: attach requires a session name"); std::process::exit(1); });
+            Command::Attach { name, detached }
         }
         name => {
             // Default: treat bare argument as attach
@@ -106,7 +137,7 @@ fn parse_args() -> Command {
                 eprintln!("error: unknown option '{}'", name);
                 std::process::exit(1);
             }
-            Command::Attach { name: name.to_string() }
+            Command::Attach { name: name.to_string(), detached: false }
         }
     }
 }
@@ -124,7 +155,8 @@ fn main() {
         Command::Kill { name } => cmd_kill(&name),
         Command::Detach { name } => cmd_detach(&name),
         Command::Run { name, cmd } => cmd_run(&name, &cmd),
-        Command::Attach { name } => cmd_attach(&name),
+        Command::History { name, format } => cmd_history(&name, format),
+        Command::Attach { name, detached } => cmd_attach(&name, detached),
     };
     std::process::exit(code);
 }
@@ -135,14 +167,17 @@ fn print_help() {
 ryx — terminal session daemon
 
 Usage:
-  ryx <session>          Attach to (or create) a session
-  ryx attach <session>   Same as above
-  ryx list [-s]          List sessions (-s for short format)
-  ryx run <session> <cmd...>  Run a command in a session
-  ryx detach <session>   Detach all clients from a session
-  ryx kill <session>     Kill a session
-  ryx version            Print version
-  ryx help               Print this help
+  ryx <session>              Attach to (or create) a session
+  ryx attach <session>       Same as above
+  ryx attach -d <session>    Create session without attaching
+  ryx new <session>          Same as attach -d
+  ryx list [-s]              List sessions (-s for short format)
+  ryx run <session> <cmd...> Run a command in a session
+  ryx history <session>      Print session output (--vt, --html)
+  ryx detach <session>       Detach all clients from a session
+  ryx kill <session>         Kill a session
+  ryx version                Print version
+  ryx help                   Print this help
 
 Detach key: Ctrl+\\"
     );
@@ -1023,7 +1058,7 @@ fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: R
 // Attach flow
 // ---------------------------------------------------------------------------
 
-fn cmd_attach(name: &str) -> i32 {
+fn cmd_attach(name: &str, detached: bool) -> i32 {
     let current = socket::session_name_from_env();
     if !current.is_empty() {
         eprintln!("error: already inside session '{}'", current);
@@ -1048,6 +1083,10 @@ fn cmd_attach(name: &str) -> i32 {
     // Check if session already exists
     match socket::session_exists(&cfg.socket_dir, &cfg.session_name) {
         Ok(true) => {
+            if detached {
+                eprintln!("error: session '{}' already exists", name);
+                return 1;
+            }
             // Try to connect to existing session
             match socket::session_connect(&path_str) {
                 Ok(fd) => {
@@ -1066,7 +1105,14 @@ fn cmd_attach(name: &str) -> i32 {
         }
     }
 
-    // Spawn new daemon via double-fork
+    // Spawn new daemon
+    if detached {
+        return match spawn_daemon_detached(&cfg) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("error: {}", e); 1 }
+        };
+    }
+
     let socket_fd = match spawn_daemon(&cfg) {
         Ok(fd) => fd,
         Err(e) => { eprintln!("error: {}", e); return 1; }
@@ -1115,6 +1161,91 @@ fn spawn_daemon(cfg: &Cfg) -> Result<RawFd, String> {
         }
     }
     unreachable!()
+}
+
+fn spawn_daemon_detached(cfg: &Cfg) -> Result<(), String> {
+    let server_fd = socket::create_socket(&cfg.socket_path)
+        .map_err(|e| format!("failed to create socket: {}", e))?;
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe { libc::close(server_fd); }
+        let _ = std::fs::remove_file(&cfg.socket_path);
+        return Err(format!("fork failed: {}", io::Error::last_os_error()));
+    }
+
+    if pid == 0 {
+        unsafe { libc::setsid(); }
+        redirect_std_to_devnull();
+        run_daemon(cfg, server_fd);
+        unsafe { libc::_exit(0); }
+    }
+
+    unsafe { libc::close(server_fd); }
+    println!("session '{}' created", cfg.session_name);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// History command
+// ---------------------------------------------------------------------------
+
+fn cmd_history(name: &str, format: util::HistoryFormat) -> i32 {
+    let cfg = match Cfg::resolve(name) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("error: {}", e); return 1; }
+    };
+    let path_str = match cfg.socket_path.to_str() {
+        Some(s) => s,
+        None => { eprintln!("error: invalid socket path"); return 1; }
+    };
+    let fd = match socket::session_connect(path_str) {
+        Ok(fd) => fd,
+        Err(e) => { eprintln!("error: cannot connect to session '{}': {}", name, e); return 1; }
+    };
+
+    let format_byte = format as u8;
+    if let Err(e) = ipc::send(fd, Tag::History, &[format_byte]) {
+        eprintln!("error: failed to send history request: {}", e);
+        unsafe { libc::close(fd); }
+        return 1;
+    }
+
+    // Read response
+    ignore_signal(Signal::SIGPIPE);
+    let mut socket_buf = SocketBuffer::new();
+    let stdout_fd: RawFd = 1;
+
+    loop {
+        let sock_bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let mut poll_fds = [PollFd::new(sock_bfd, PollFlags::POLLIN)];
+
+        match poll(&mut poll_fds, PollTimeout::from(5000u16)) {
+            Ok(0) => { break; } // timeout
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => break,
+        }
+
+        match socket_buf.read(fd) {
+            Ok(0) => break,
+            Ok(_) => {
+                while let Some((tag, payload)) = socket_buf.next() {
+                    if tag == Tag::History {
+                        if !payload.is_empty() {
+                            let _ = write_all_raw(stdout_fd, &payload);
+                        }
+                        unsafe { libc::close(fd); }
+                        return 0;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    unsafe { libc::close(fd); }
+    0
 }
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,11 @@
 - [x] `src/logger.rs` — File-based logging with 5MB rotation #feature
 - [x] `src/util.rs` — Shell quoting, DA responses, task exit markers, terminal serialization (vt100), session listing #feature
 - [x] `src/main.rs` — Core runtime: CLI, PTY spawning, daemon/client event loops, attach flow #feature
+- [x] list — enumerate active sessions with status info #feature
+- [x] kill — terminate a session by name #feature
+- [x] detach — disconnect all clients from a session #feature
+- [x] history — retrieve session output (plain, --vt, --html) #feature
+- [x] Detached spawn — `ryx new <session>` or `ryx attach -d <session>` #feature
 
 ## Key design decisions
 - Using `vt100` crate instead of ghostty-vt for terminal state tracking
@@ -29,7 +34,7 @@
 - Using `nix` crate for POSIX APIs (poll, signals, sockets, termios)
 - Using `libc` crate for forkpty, ioctl
 - Binary IPC protocol is wire-compatible with zmx (1-byte tag + 4-byte LE length + payload)
-- Double-fork daemonization with ready pipe for parent synchronization
+- Single fork daemonization with setsid(), socket created before fork
 - Self-pipe trick for integrating signals into poll() event loop
 - Box::leak for logger to satisfy `log::set_logger`'s `&'static` requirement
 - Detach key: Ctrl+\ (0x1c) plus Kitty protocol variant
