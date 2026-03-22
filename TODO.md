@@ -1,7 +1,6 @@
 # ryx — Terminal session daemon
 
 ## Now
-- [ ] `src/completions.rs` — Shell completion scripts (bash, zsh, fish) #feature
 
 ## Next
 
@@ -22,3 +21,4 @@
 - [x] history — retrieve session output (plain, --vt, --html) #feature
 - [x] Detached spawn — `ryx new <session>` or `ryx attach -d <session>` #feature
 - [x] wait — poll sessions for task completion, prefix matching, aggregate exit codes #feature
+- [x] completions — shell completion scripts for bash, zsh, fish via `ryx completions <shell>` #feature

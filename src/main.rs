@@ -1,3 +1,4 @@
+mod completions;
 mod ipc;
 mod logger;
 mod socket;
@@ -53,6 +54,7 @@ enum Command {
     Detach { name: String },
     History { name: String, format: util::HistoryFormat },
     Wait { names: Vec<String> },
+    Completions { shell: String },
     Version,
     Help,
 }
@@ -117,6 +119,13 @@ fn parse_args() -> Command {
             let names: Vec<String> = args[1..].to_vec();
             Command::Wait { names }
         }
+        "completions" => {
+            if args.len() < 2 {
+                eprintln!("error: completions requires a shell name (bash, zsh, fish)");
+                std::process::exit(1);
+            }
+            Command::Completions { shell: args[1].clone() }
+        }
         "new" => {
             if args.len() < 2 {
                 eprintln!("error: new requires a session name");
@@ -162,6 +171,7 @@ fn main() {
         Command::Run { name, cmd } => cmd_run(&name, &cmd),
         Command::History { name, format } => cmd_history(&name, format),
         Command::Wait { names } => cmd_wait(&names),
+        Command::Completions { shell } => { completions::print_completions(&shell); 0 }
         Command::Attach { name, detached } => cmd_attach(&name, detached),
     };
     std::process::exit(code);
@@ -183,6 +193,7 @@ Usage:
   ryx detach <session>       Detach all clients from a session
   ryx kill <session>         Kill a session
   ryx wait <name>...         Wait for sessions to complete
+  ryx completions <shell>    Print shell completions (bash, zsh, fish)
   ryx version                Print version
   ryx help                   Print this help
 
