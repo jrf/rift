@@ -50,6 +50,7 @@ enum Command {
     List { short: bool },
     Run { name: String, cmd: Vec<String> },
     Kill { name: String },
+    Detach { name: String },
     Version,
     Help,
 }
@@ -75,6 +76,13 @@ fn parse_args() -> Command {
                 std::process::exit(1);
             }
             Command::Kill { name: args[1].clone() }
+        }
+        "detach" | "d" => {
+            if args.len() < 2 {
+                eprintln!("error: detach requires a session name");
+                std::process::exit(1);
+            }
+            Command::Detach { name: args[1].clone() }
         }
         "run" => {
             if args.len() < 2 {
@@ -114,6 +122,7 @@ fn main() {
         Command::Version => { println!("ryx {}", env!("CARGO_PKG_VERSION")); 0 }
         Command::List { short } => cmd_list(short),
         Command::Kill { name } => cmd_kill(&name),
+        Command::Detach { name } => cmd_detach(&name),
         Command::Run { name, cmd } => cmd_run(&name, &cmd),
         Command::Attach { name } => cmd_attach(&name),
     };
@@ -130,6 +139,7 @@ Usage:
   ryx attach <session>   Same as above
   ryx list [-s]          List sessions (-s for short format)
   ryx run <session> <cmd...>  Run a command in a session
+  ryx detach <session>   Detach all clients from a session
   ryx kill <session>     Kill a session
   ryx version            Print version
   ryx help               Print this help
@@ -292,6 +302,8 @@ fn enter_raw_mode(fd: RawFd) -> io::Result<Termios> {
         .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     let mut raw = saved.clone();
     termios::cfmakeraw(&mut raw);
+    // Disable SIGQUIT so Ctrl+\ can be used as detach key
+    raw.control_chars[nix::sys::termios::SpecialCharacterIndices::VQUIT as usize] = 0;
     termios::tcsetattr(&bfd, SetArg::TCSAFLUSH, &raw)
         .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     Ok(saved)
@@ -354,6 +366,28 @@ fn cmd_kill(name: &str) -> i32 {
     };
     if let Err(e) = ipc::send(fd, Tag::Kill, &[]) {
         eprintln!("error: failed to send kill: {}", e);
+        unsafe { libc::close(fd); }
+        return 1;
+    }
+    unsafe { libc::close(fd); }
+    0
+}
+
+fn cmd_detach(name: &str) -> i32 {
+    let cfg = match Cfg::resolve(name) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("error: {}", e); return 1; }
+    };
+    let path_str = match cfg.socket_path.to_str() {
+        Some(s) => s,
+        None => { eprintln!("error: invalid socket path"); return 1; }
+    };
+    let fd = match socket::session_connect(path_str) {
+        Ok(fd) => fd,
+        Err(e) => { eprintln!("error: cannot connect to session '{}': {}", name, e); return 1; }
+    };
+    if let Err(e) = ipc::send(fd, Tag::DetachAll, &[]) {
+        eprintln!("error: failed to send detach: {}", e);
         unsafe { libc::close(fd); }
         return 1;
     }
@@ -990,6 +1024,12 @@ fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: R
 // ---------------------------------------------------------------------------
 
 fn cmd_attach(name: &str) -> i32 {
+    let current = socket::session_name_from_env();
+    if !current.is_empty() {
+        eprintln!("error: already inside session '{}'", current);
+        return 1;
+    }
+
     let cfg = match Cfg::resolve(name) {
         Ok(c) => c,
         Err(e) => { eprintln!("error: {}", e); return 1; }
