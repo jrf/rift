@@ -52,6 +52,7 @@ enum Command {
     Kill { name: String },
     Detach { name: String },
     History { name: String, format: util::HistoryFormat },
+    Wait { names: Vec<String> },
     Version,
     Help,
 }
@@ -112,6 +113,10 @@ fn parse_args() -> Command {
             }
             Command::History { name, format }
         }
+        "wait" | "w" => {
+            let names: Vec<String> = args[1..].to_vec();
+            Command::Wait { names }
+        }
         "new" => {
             if args.len() < 2 {
                 eprintln!("error: new requires a session name");
@@ -156,6 +161,7 @@ fn main() {
         Command::Detach { name } => cmd_detach(&name),
         Command::Run { name, cmd } => cmd_run(&name, &cmd),
         Command::History { name, format } => cmd_history(&name, format),
+        Command::Wait { names } => cmd_wait(&names),
         Command::Attach { name, detached } => cmd_attach(&name, detached),
     };
     std::process::exit(code);
@@ -176,6 +182,7 @@ Usage:
   ryx history <session>      Print session output (--vt, --html)
   ryx detach <session>       Detach all clients from a session
   ryx kill <session>         Kill a session
+  ryx wait <name>...         Wait for sessions to complete
   ryx version                Print version
   ryx help                   Print this help
 
@@ -1246,6 +1253,95 @@ fn cmd_history(name: &str, format: util::HistoryFormat) -> i32 {
 
     unsafe { libc::close(fd); }
     0
+}
+
+// ---------------------------------------------------------------------------
+// Wait command
+// ---------------------------------------------------------------------------
+
+fn cmd_wait(names: &[String]) -> i32 {
+    let socket_dir = socket::socket_dir();
+    let prefix = socket::session_prefix();
+
+    // If no names given, use prefix alone (wait for all prefixed sessions)
+    let patterns: Vec<String> = if names.is_empty() {
+        if prefix.is_empty() {
+            eprintln!("error: wait requires session names or RYX_SESSION_PREFIX");
+            return 1;
+        }
+        vec![prefix.clone()]
+    } else {
+        names.iter().map(|n| format!("{}{}", prefix, n)).collect()
+    };
+
+    let mut no_match_count = 0;
+    let mut last_exit_code: i32 = 0;
+
+    loop {
+        let entries = match util::get_session_entries(&socket_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Vec::new()
+                } else {
+                    eprintln!("error: {}", e);
+                    return 1;
+                }
+            }
+        };
+
+        // Find sessions matching any pattern (prefix match)
+        let matching: Vec<&util::SessionEntry> = entries.iter()
+            .filter(|e| patterns.iter().any(|p| e.name.starts_with(p)))
+            .collect();
+
+        if matching.is_empty() {
+            no_match_count += 1;
+            if no_match_count >= 3 {
+                eprintln!("error: no matching sessions found");
+                return 2;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        }
+        no_match_count = 0;
+
+        let mut all_done = true;
+        let mut any_unreachable = false;
+
+        for session in &matching {
+            if session.is_error {
+                eprintln!("task unreachable: {}", session.name);
+                any_unreachable = true;
+                continue;
+            }
+
+            match session.task_ended_at {
+                Some(t) if t > 0 => {
+                    if let Some(code) = session.task_exit_code {
+                        if code != 0 {
+                            last_exit_code = code as i32;
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("still waiting task={}", session.name);
+                    all_done = false;
+                }
+            }
+        }
+
+        if any_unreachable {
+            return 1;
+        }
+
+        if all_done {
+            eprintln!("tasks completed!");
+            return last_exit_code;
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 // ---------------------------------------------------------------------------

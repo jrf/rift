@@ -4,7 +4,6 @@
 - [ ] `src/completions.rs` — Shell completion scripts (bash, zsh, fish) #feature
 
 ## Next
-- [ ] wait (poll sessions for task completion) #feature
 
 ## Later
 
@@ -22,3 +21,4 @@
 - [x] detach — disconnect all clients from a session #feature
 - [x] history — retrieve session output (plain, --vt, --html) #feature
 - [x] Detached spawn — `ryx new <session>` or `ryx attach -d <session>` #feature
+- [x] wait — poll sessions for task completion, prefix matching, aggregate exit codes #feature
