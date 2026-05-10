@@ -49,8 +49,10 @@ impl Cfg {
 enum Command {
     Attach { name: String, detached: bool },
     List { short: bool },
-    Run { name: String, cmd: Vec<String> },
-    Kill { name: String },
+    Run { name: String, cmd: Vec<String>, detached: bool },
+    Send { name: String, text: Vec<String> },
+    Tail { name: String },
+    Kill { name: String, force: bool },
     Detach { name: String },
     History { name: String, format: util::HistoryFormat },
     Wait { names: Vec<String> },
@@ -68,18 +70,23 @@ fn parse_args() -> Command {
 
     let first = args[0].as_str();
     match first {
-        "--help" | "-h" | "help" => Command::Help,
-        "--version" | "-V" | "version" => Command::Version,
-        "list" | "ls" => {
+        "--help" | "-h" | "help" | "h" => Command::Help,
+        "--version" | "-V" | "version" | "v" => Command::Version,
+        "list" | "ls" | "l" => {
             let short = args.iter().any(|a| a == "-s" || a == "--short");
             Command::List { short }
         }
-        "kill" => {
+        "kill" | "k" => {
             if args.len() < 2 {
                 eprintln!("error: kill requires a session name");
                 std::process::exit(1);
             }
-            Command::Kill { name: args[1].clone() }
+            let force = args.iter().any(|a| a == "-f" || a == "--force");
+            let name = args[1..].iter()
+                .find(|a| !a.starts_with('-'))
+                .cloned()
+                .unwrap_or_else(|| { eprintln!("error: kill requires a session name"); std::process::exit(1); });
+            Command::Kill { name, force }
         }
         "detach" | "d" => {
             let name = if args.len() >= 2 {
@@ -94,14 +101,39 @@ fn parse_args() -> Command {
             };
             Command::Detach { name }
         }
-        "run" => {
+        "run" | "r" => {
             if args.len() < 2 {
                 eprintln!("error: run requires a session name");
                 std::process::exit(1);
             }
+            let detached = args.iter().any(|a| a == "-d" || a == "--detached");
+            let positional: Vec<String> = args[1..].iter()
+                .filter(|a| !a.starts_with('-'))
+                .cloned()
+                .collect();
+            if positional.is_empty() {
+                eprintln!("error: run requires a session name");
+                std::process::exit(1);
+            }
+            let name = positional[0].clone();
+            let cmd = positional[1..].to_vec();
+            Command::Run { name, cmd, detached }
+        }
+        "send" | "s" => {
+            if args.len() < 2 {
+                eprintln!("error: send requires a session name");
+                std::process::exit(1);
+            }
             let name = args[1].clone();
-            let cmd = args[2..].to_vec();
-            Command::Run { name, cmd }
+            let text = args[2..].to_vec();
+            Command::Send { name, text }
+        }
+        "tail" | "t" => {
+            if args.len() < 2 {
+                eprintln!("error: tail requires a session name");
+                std::process::exit(1);
+            }
+            Command::Tail { name: args[1].clone() }
         }
         "history" | "hi" => {
             let mut session_name: Option<String> = None;
@@ -125,21 +157,21 @@ fn parse_args() -> Command {
             let names: Vec<String> = args[1..].to_vec();
             Command::Wait { names }
         }
-        "completions" => {
+        "completions" | "c" => {
             if args.len() < 2 {
                 eprintln!("error: completions requires a shell name (bash, zsh, fish)");
                 std::process::exit(1);
             }
             Command::Completions { shell: args[1].clone() }
         }
-        "new" => {
+        "new" | "n" => {
             if args.len() < 2 {
                 eprintln!("error: new requires a session name");
                 std::process::exit(1);
             }
             Command::Attach { name: args[1].clone(), detached: true }
         }
-        "attach" => {
+        "attach" | "a" => {
             if args.len() < 2 {
                 eprintln!("error: attach requires a session name");
                 std::process::exit(1);
@@ -170,11 +202,13 @@ fn main() {
     let cmd = parse_args();
     let code = match cmd {
         Command::Help => { print_help(); 0 }
-        Command::Version => { println!("ryx {}", env!("CARGO_PKG_VERSION")); 0 }
+        Command::Version => { println!("rif {}", env!("CARGO_PKG_VERSION")); 0 }
         Command::List { short } => cmd_list(short),
-        Command::Kill { name } => cmd_kill(&name),
+        Command::Kill { name, force } => cmd_kill(&name, force),
         Command::Detach { name } => cmd_detach(&name),
-        Command::Run { name, cmd } => cmd_run(&name, &cmd),
+        Command::Run { name, cmd, detached } => cmd_run(&name, &cmd, detached),
+        Command::Send { name, text } => cmd_send(&name, &text),
+        Command::Tail { name } => cmd_tail(&name),
         Command::History { name, format } => cmd_history(&name, format),
         Command::Wait { names } => cmd_wait(&names),
         Command::Completions { shell } => { completions::print_completions(&shell); 0 }
@@ -186,22 +220,24 @@ fn main() {
 fn print_help() {
     println!(
         "\
-ryx — terminal session daemon
+rif — terminal session daemon
 
 Usage:
-  ryx <session>              Attach to (or create) a session
-  ryx attach <session>       Same as above
-  ryx attach -d <session>    Create session without attaching
-  ryx new <session>          Same as attach -d
-  ryx list [-s]              List sessions (-s for short format)
-  ryx run <session> <cmd...> Run a command in a session
-  ryx history <session>      Print session output (--vt, --html)
-  ryx detach <session>       Detach all clients from a session
-  ryx kill <session>         Kill a session
-  ryx wait <name>...         Wait for sessions to complete
-  ryx completions <shell>    Print shell completions (bash, zsh, fish)
-  ryx version                Print version
-  ryx help                   Print this help
+  rif <session>                Attach to (or create) a session
+  rif attach|a <session>       Same as above
+  rif attach -d <session>      Create session without attaching
+  rif new|n <session>          Same as attach -d
+  rif list|ls|l [-s]           List sessions (-s for short format)
+  rif run|r <session> <cmd...> Run a command in a session (-d for detached)
+  rif send|s <session> <text>  Send keystrokes to a session
+  rif tail|t <session>         Follow session output in real-time
+  rif history|hi <session>     Print session output (--vt, --html)
+  rif detach|d [<session>]     Detach all clients from a session
+  rif kill|k <session>         Kill a session (-f to force)
+  rif wait|w <name>...         Wait for sessions to complete
+  rif completions|c <shell>    Print shell completions (bash, zsh, fish)
+  rif version|v                Print version
+  rif help|h                   Print this help
 
 Detach key: Ctrl+\\"
     );
@@ -410,7 +446,7 @@ fn cmd_list(short: bool) -> i32 {
     }
 }
 
-fn cmd_kill(name: &str) -> i32 {
+fn cmd_kill(name: &str, force: bool) -> i32 {
     let cfg = match Cfg::resolve(name) {
         Ok(c) => c,
         Err(e) => { eprintln!("error: {}", e); return 1; }
@@ -420,35 +456,46 @@ fn cmd_kill(name: &str) -> i32 {
         None => { eprintln!("error: invalid socket path"); return 1; }
     };
 
-    // Probe first to get the pid for fallback SIGTERM
     let pid = match ipc::probe_session(path_str) {
         Ok(result) => {
             let pid = result.info.pid;
-            // Reuse the probe connection to send kill
-            let _ = ipc::send(result.fd, Tag::Kill, &[]);
-            unsafe { libc::close(result.fd); }
+            if force {
+                unsafe { libc::close(result.fd); }
+            } else {
+                let _ = ipc::send(result.fd, Tag::Kill, &[]);
+                unsafe { libc::close(result.fd); }
+            }
             Some(pid)
         }
         Err(_) => {
-            // Probe failed — try a plain connect + kill anyway
-            match socket::session_connect(path_str) {
-                Ok(fd) => {
-                    let _ = ipc::send(fd, Tag::Kill, &[]);
-                    unsafe { libc::close(fd); }
-                }
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::ConnectionRefused {
-                        // Dead socket, just clean it up
-                        socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
-                        return 0;
+            if !force {
+                match socket::session_connect(path_str) {
+                    Ok(fd) => {
+                        let _ = ipc::send(fd, Tag::Kill, &[]);
+                        unsafe { libc::close(fd); }
                     }
-                    eprintln!("error: cannot connect to session '{}': {}", name, e);
-                    return 1;
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::ConnectionRefused {
+                            socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
+                            return 0;
+                        }
+                        eprintln!("error: cannot connect to session '{}': {}", name, e);
+                        return 1;
+                    }
                 }
             }
             None
         }
     };
+
+    if force {
+        if let Some(pid) = pid {
+            unsafe { libc::kill(pid, libc::SIGKILL); }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
+        return 0;
+    }
 
     // Wait for socket to disappear
     for _ in 0..5 {
@@ -462,7 +509,6 @@ fn cmd_kill(name: &str) -> i32 {
     // Socket still exists — fall back to SIGTERM if we have a pid
     if let Some(pid) = pid {
         unsafe { libc::kill(pid, libc::SIGTERM); }
-        // Wait again for cleanup
         for _ in 0..5 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             match socket::session_exists(&cfg.socket_dir, &cfg.session_name) {
@@ -525,8 +571,8 @@ fn spawn_pty(shell: &str, rows: u16, cols: u16, session_name: &str) -> io::Resul
     if pid == 0 {
         // Child process
         unsafe {
-            // Set RYX_SESSION env var
-            let key = std::ffi::CString::new("RYX_SESSION").unwrap();
+            // Set RIF_SESSION env var
+            let key = std::ffi::CString::new("RIF_SESSION").unwrap();
             let val = std::ffi::CString::new(session_name).unwrap();
             libc::setenv(key.as_ptr(), val.as_ptr(), 1);
 
@@ -824,7 +870,7 @@ impl Daemon {
                             let cmd = String::from_utf8_lossy(&payload);
                             // Wrap with task marker for exit code tracking
                             let wrapped = format!(
-                                "{}; printf 'RYX_TASK_COMPLETED:%d' $?\n",
+                                "{}; printf 'RIF_TASK_COMPLETED:%d' $?\n",
                                 cmd
                             );
                             let _ = write_all_raw(self.pty_master_fd, wrapped.as_bytes());
@@ -1334,7 +1380,7 @@ fn cmd_wait(names: &[String]) -> i32 {
     // If no names given, use prefix alone (wait for all prefixed sessions)
     let patterns: Vec<String> = if names.is_empty() {
         if prefix.is_empty() {
-            eprintln!("error: wait requires session names or RYX_SESSION_PREFIX");
+            eprintln!("error: wait requires session names or RIF_SESSION_PREFIX");
             return 1;
         }
         vec![prefix.clone()]
@@ -1416,7 +1462,7 @@ fn cmd_wait(names: &[String]) -> i32 {
 // Run command
 // ---------------------------------------------------------------------------
 
-fn cmd_run(name: &str, cmd_args: &[String]) -> i32 {
+fn cmd_run(name: &str, cmd_args: &[String], detached: bool) -> i32 {
     if cmd_args.is_empty() {
         eprintln!("error: run requires a command");
         return 1;
@@ -1472,11 +1518,15 @@ fn cmd_run(name: &str, cmd_args: &[String]) -> i32 {
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Send Run command
     if let Err(e) = ipc::send(socket_fd, Tag::Run, cmd_str.as_bytes()) {
         eprintln!("error: failed to send command: {}", e);
         unsafe { libc::close(socket_fd); }
         return 1;
+    }
+
+    if detached {
+        unsafe { libc::close(socket_fd); }
+        return 0;
     }
 
     // Read output until Ack
@@ -1518,6 +1568,95 @@ fn cmd_run(name: &str, cmd_args: &[String]) -> i32 {
 
     unsafe { libc::close(socket_fd); }
     1
+}
+
+// ---------------------------------------------------------------------------
+// Send command
+// ---------------------------------------------------------------------------
+
+fn cmd_send(name: &str, text_args: &[String]) -> i32 {
+    let cfg = match Cfg::resolve(name) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("error: {}", e); return 1; }
+    };
+    let path_str = match cfg.socket_path.to_str() {
+        Some(s) => s,
+        None => { eprintln!("error: invalid socket path"); return 1; }
+    };
+    let fd = match socket::session_connect(path_str) {
+        Ok(fd) => fd,
+        Err(e) => { eprintln!("error: cannot connect to session '{}': {}", name, e); return 1; }
+    };
+
+    let data = if text_args.is_empty() {
+        let mut buf = Vec::new();
+        if io::Read::read_to_end(&mut io::stdin(), &mut buf).is_err() {
+            eprintln!("error: failed to read stdin");
+            unsafe { libc::close(fd); }
+            return 1;
+        }
+        buf
+    } else {
+        text_args.join(" ").into_bytes()
+    };
+
+    if let Err(e) = ipc::send(fd, Tag::Input, &data) {
+        eprintln!("error: failed to send: {}", e);
+        unsafe { libc::close(fd); }
+        return 1;
+    }
+    unsafe { libc::close(fd); }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Tail command
+// ---------------------------------------------------------------------------
+
+fn cmd_tail(name: &str) -> i32 {
+    let cfg = match Cfg::resolve(name) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("error: {}", e); return 1; }
+    };
+    let path_str = match cfg.socket_path.to_str() {
+        Some(s) => s,
+        None => { eprintln!("error: invalid socket path"); return 1; }
+    };
+    let socket_fd = match socket::session_connect(path_str) {
+        Ok(fd) => fd,
+        Err(e) => { eprintln!("error: cannot connect to session '{}': {}", name, e); return 1; }
+    };
+
+    ignore_signal(Signal::SIGPIPE);
+    let mut socket_buf = SocketBuffer::new();
+    let stdout_fd: RawFd = 1;
+
+    loop {
+        let sock_bfd = unsafe { BorrowedFd::borrow_raw(socket_fd) };
+        let mut poll_fds = [PollFd::new(sock_bfd, PollFlags::POLLIN)];
+
+        match poll(&mut poll_fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => break,
+        }
+
+        match socket_buf.read(socket_fd) {
+            Ok(0) => break,
+            Ok(_) => {
+                while let Some((tag, payload)) = socket_buf.next() {
+                    if tag == Tag::Output {
+                        let _ = write_all_raw(stdout_fd, &payload);
+                    }
+                }
+            }
+            Err(nix::errno::Errno::EAGAIN) => {}
+            Err(_) => break,
+        }
+    }
+
+    unsafe { libc::close(socket_fd); }
+    0
 }
 
 // ---------------------------------------------------------------------------

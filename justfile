@@ -14,12 +14,12 @@ run:
 
 # Install to ~/.local/bin
 install: release
-    cp target/release/ryx ~/.local/bin/
-    codesign -s - ~/.local/bin/ryx
+    cp target/release/rif ~/.local/bin/
+    codesign -s - ~/.local/bin/rif
 
 # Uninstall from ~/.local/bin
 uninstall:
-    rm -f ~/.local/bin/ryx
+    rm -f ~/.local/bin/rif
 
 # Remove build artifacts
 clean:

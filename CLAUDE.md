@@ -16,13 +16,13 @@ Zero warnings policy — all builds must be warning-free.
 
 ## Architecture
 
-ryx is a terminal session daemon (like tmux/screen/abduco). A **daemon** process owns a PTY and a shell. **Clients** connect via Unix domain sockets to interact with the shell. Detaching leaves the daemon running; reattaching restores terminal state.
+rif is a terminal session daemon (like tmux/screen/abduco). A **daemon** process owns a PTY and a shell. **Clients** connect via Unix domain sockets to interact with the shell. Detaching leaves the daemon running; reattaching restores terminal state.
 
 ### Module Responsibilities
 
 - **main.rs** — CLI parsing, daemon event loop, client event loop, PTY spawning, attach/detach/run flow, signal handling
 - **ipc.rs** — Binary protocol: 5-byte header (1 tag + 4 LE length) + payload. `SocketBuffer` handles streaming/partial reads. `probe_session()` for health checks
-- **socket.rs** — Unix domain socket lifecycle (create, connect, cleanup stale), session name validation, socket directory resolution (`RYX_DIR` > `XDG_RUNTIME_DIR/ryx` > `TMPDIR/ryx-{uid}`)
+- **socket.rs** — Unix domain socket lifecycle (create, connect, cleanup stale), session name validation, socket directory resolution (`RIF_DIR` > `XDG_RUNTIME_DIR/rif` > `TMPDIR/rif-{uid}`)
 - **logger.rs** — File logger with 5MB rotation, implements `log::Log` trait. `Box::leak`'d for `&'static` lifetime
 - **util.rs** — DA query/response handling, terminal state serialization (vt100), session listing, shell quoting, task exit marker detection, Kitty keyboard protocol
 
@@ -41,7 +41,7 @@ Single `poll()` over: signal pipe, server socket, PTY master, all client fds. Ha
 
 ### PTY Spawn Flow
 
-`spawn_pty()` calls `libc::forkpty()`. Child sets `RYX_SESSION` env var, resets SIGPIPE, execs shell as login shell (`-fish`, `-zsh`, etc.). Shell is detected via `RYX_SHELL` > `SHELL` > `/bin/sh`.
+`spawn_pty()` calls `libc::forkpty()`. Child sets `RIF_SESSION` env var, resets SIGPIPE, execs shell as login shell (`-fish`, `-zsh`, etc.). Shell is detected via `RIF_SHELL` > `SHELL` > `/bin/sh`.
 
 ### Gotchas
 

@@ -10,13 +10,13 @@ pub fn print_completions(shell: &str) {
     }
 }
 
-const BASH: &str = r#"_ryx_completions() {
+const BASH: &str = r#"_rif_completions() {
   local cur prev words cword
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="attach new run detach list completions kill history wait version help"
+  local commands="attach new run send tail detach list completions kill history wait version help"
 
   if [[ $COMP_CWORD -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -24,8 +24,8 @@ const BASH: &str = r#"_ryx_completions() {
   fi
 
   case "$prev" in
-    attach|new|run|kill|history|hi|detach|d|wait|w)
-      local sessions=$(ryx list --short 2>/dev/null | tr '\n' ' ')
+    attach|a|new|n|run|r|send|s|tail|t|kill|k|history|hi|detach|d|wait|w)
+      local sessions=$(rif list --short 2>/dev/null | tr '\n' ' ')
       COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
       ;;
     completions)
@@ -39,10 +39,10 @@ const BASH: &str = r#"_ryx_completions() {
   esac
 }
 
-complete -o bashdefault -o default -F _ryx_completions ryx
+complete -o bashdefault -o default -F _rif_completions rif
 "#;
 
-const ZSH: &str = r#"_ryx() {
+const ZSH: &str = r#"_rif() {
   local context state state_descr line
   typeset -A opt_args
 
@@ -59,6 +59,8 @@ const ZSH: &str = r#"_ryx() {
         'attach:Attach to session, creating if needed'
         'new:Create session without attaching'
         'run:Run a command in a session'
+        'send:Send keystrokes to a session'
+        'tail:Follow session output in real-time'
         'detach:Detach all clients from a session'
         'list:List active sessions'
         'completions:Print shell completion script'
@@ -72,8 +74,8 @@ const ZSH: &str = r#"_ryx() {
       ;;
     args)
       case $words[2] in
-        attach|new|kill|run|detach|d|history|hi|wait|w)
-          _ryx_sessions
+        attach|a|new|n|kill|k|run|r|send|s|tail|t|detach|d|history|hi|wait|w)
+          _rif_sessions
           ;;
         completions)
           _values 'shell' 'bash' 'zsh' 'fish'
@@ -88,10 +90,10 @@ const ZSH: &str = r#"_ryx() {
   esac
 }
 
-_ryx_sessions() {
+_rif_sessions() {
   local -a sessions
 
-  local local_sessions=$(ryx list --short 2>/dev/null)
+  local local_sessions=$(rif list --short 2>/dev/null)
   if [[ -n "$local_sessions" ]]; then
     sessions+=(${(f)local_sessions})
   fi
@@ -99,31 +101,35 @@ _ryx_sessions() {
   _describe 'local session' sessions
 }
 
-compdef _ryx ryx
+compdef _rif rif
 "#;
 
-const FISH: &str = r#"complete -c ryx -f
+const FISH: &str = r#"complete -c rif -f
 
-complete -c ryx -n "__fish_is_nth_token 1" -a 'attach' -d 'Attach to session, creating if needed'
-complete -c ryx -n "__fish_is_nth_token 1" -a 'new' -d 'Create session without attaching'
-complete -c ryx -n "__fish_is_nth_token 1" -a 'run' -d 'Run a command in a session'
-complete -c ryx -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from a session'
-complete -c ryx -n "__fish_is_nth_token 1" -a 'ls list' -d 'List active sessions'
-complete -c ryx -n "__fish_is_nth_token 1" -a 'completions' -d 'Print shell completion script'
-complete -c ryx -n "__fish_is_nth_token 1" -a 'kill' -d 'Kill a session'
-complete -c ryx -n "__fish_is_nth_token 1" -a 'hi history' -d 'Print session output'
-complete -c ryx -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for sessions to complete'
-complete -c ryx -n "__fish_is_nth_token 1" -a 'version' -d 'Print version'
-complete -c ryx -s V -l version -d 'Print version'
-complete -c ryx -n "__fish_is_nth_token 1" -a 'help' -d 'Print help'
-complete -c ryx -s h -d 'Print help'
+complete -c rif -n "__fish_is_nth_token 1" -a 'a attach' -d 'Attach to session, creating if needed'
+complete -c rif -n "__fish_is_nth_token 1" -a 'n new' -d 'Create session without attaching'
+complete -c rif -n "__fish_is_nth_token 1" -a 'r run' -d 'Run a command in a session'
+complete -c rif -n "__fish_is_nth_token 1" -a 's send' -d 'Send keystrokes to a session'
+complete -c rif -n "__fish_is_nth_token 1" -a 't tail' -d 'Follow session output in real-time'
+complete -c rif -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from a session'
+complete -c rif -n "__fish_is_nth_token 1" -a 'l ls list' -d 'List active sessions'
+complete -c rif -n "__fish_is_nth_token 1" -a 'c completions' -d 'Print shell completion script'
+complete -c rif -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
+complete -c rif -n "__fish_is_nth_token 1" -a 'hi history' -d 'Print session output'
+complete -c rif -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for sessions to complete'
+complete -c rif -n "__fish_is_nth_token 1" -a 'v version' -d 'Print version'
+complete -c rif -s V -l version -d 'Print version'
+complete -c rif -n "__fish_is_nth_token 1" -a 'h help' -d 'Print help'
+complete -c rif -s h -d 'Print help'
 
-complete -c ryx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach new run kill detach d history hi wait w" -a '(ryx list --short 2>/dev/null)' -d 'Session name'
+complete -c rif -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s tail t kill k detach d history hi wait w" -a '(rif list --short 2>/dev/null)' -d 'Session name'
 
-complete -c ryx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions" -a 'bash zsh fish' -d Shell
+complete -c rif -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish' -d Shell
 
-complete -c ryx -n "__fish_seen_subcommand_from list ls" -l short -s s -d 'Short output'
-complete -c ryx -n "__fish_seen_subcommand_from history hi" -l vt -d 'VT escape sequence format'
-complete -c ryx -n "__fish_seen_subcommand_from history hi" -l html -d 'HTML format'
-complete -c ryx -n "__fish_seen_subcommand_from attach" -s d -l detached -d 'Create without attaching'
+complete -c rif -n "__fish_seen_subcommand_from list ls l" -l short -s s -d 'Short output'
+complete -c rif -n "__fish_seen_subcommand_from history hi" -l vt -d 'VT escape sequence format'
+complete -c rif -n "__fish_seen_subcommand_from history hi" -l html -d 'HTML format'
+complete -c rif -n "__fish_seen_subcommand_from attach a" -s d -l detached -d 'Create without attaching'
+complete -c rif -n "__fish_seen_subcommand_from run r" -s d -l detached -d 'Run detached (background)'
+complete -c rif -n "__fish_seen_subcommand_from kill k" -s f -l force -d 'Force kill (SIGKILL)'
 "#;

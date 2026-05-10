@@ -13,11 +13,11 @@ use nix::sys::stat::SFlag;
 pub const MAX_SOCKET_PATH_LEN: usize = 104 - 1; // macOS sockaddr_un.sun_path is 104
 
 pub fn session_prefix() -> String {
-    std::env::var("RYX_SESSION_PREFIX").unwrap_or_default()
+    std::env::var("RIF_SESSION_PREFIX").unwrap_or_default()
 }
 
 pub fn session_name_from_env() -> String {
-    std::env::var("RYX_SESSION").unwrap_or_default()
+    std::env::var("RIF_SESSION").unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -49,18 +49,18 @@ pub fn get_session_name(prefix: &str, name: &str) -> Result<String, SessionNameE
 }
 
 /// Resolve the socket directory.
-/// Priority: RYX_DIR > XDG_RUNTIME_DIR/ryx > TMPDIR/ryx-{uid}
+/// Priority: RIF_DIR > XDG_RUNTIME_DIR/rif > TMPDIR/rif-{uid}
 pub fn socket_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("RYX_DIR") {
+    if let Ok(dir) = std::env::var("RIF_DIR") {
         return PathBuf::from(dir);
     }
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(xdg).join("ryx");
+        return PathBuf::from(xdg).join("rif");
     }
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let tmpdir = tmpdir.trim_end_matches('/');
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("{}/ryx-{}", tmpdir, uid))
+    PathBuf::from(format!("{}/rif-{}", tmpdir, uid))
 }
 
 #[derive(Debug)]
