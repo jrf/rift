@@ -53,22 +53,17 @@ impl LogSystem {
     pub fn log(&self, level: log::Level, target: &str, message: &str) {
         let mut inner = self.inner.lock().unwrap();
 
-        let _file = match inner.file.as_mut() {
-            Some(f) => f,
-            None => {
-                eprintln!("[{}] ({}): {}", level, target, message);
-                return;
-            }
-        };
+        if inner.file.is_none() {
+            eprintln!("[{}] ({}): {}", level, target, message);
+            return;
+        }
 
         if inner.current_size >= MAX_SIZE {
             if let Err(e) = rotate(&mut inner) {
                 eprintln!("log rotation failed: {}", e);
             }
-            // Re-borrow after rotation
-            match inner.file.as_mut() {
-                Some(f) => { let _ = f; }
-                None => return,
+            if inner.file.is_none() {
+                return;
             }
         }
 

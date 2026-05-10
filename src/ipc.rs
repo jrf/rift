@@ -6,8 +6,25 @@ use nix::unistd;
 
 use crate::socket;
 
+pub struct OwnedFd(pub RawFd);
+
+impl OwnedFd {
+    pub fn raw(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { libc::close(self.0); }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[allow(dead_code)]
 pub enum Tag {
     Input = 0,
     Output = 1,
@@ -200,47 +217,46 @@ impl std::fmt::Display for ProbeError {
 }
 
 pub struct ProbeResult {
-    pub fd: RawFd,
+    pub fd: OwnedFd,
     pub info: Info,
 }
 
 pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
-    let fd = socket::session_connect(socket_path).map_err(|e| {
+    let raw_fd = socket::session_connect(socket_path).map_err(|e| {
         if e.kind() == io::ErrorKind::ConnectionRefused {
             ProbeError::ConnectionRefused
         } else {
             ProbeError::Unexpected(format!("{}", e))
         }
     })?;
+    let fd = OwnedFd(raw_fd);
 
-    send(fd, Tag::Info, &[]).map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
-
-    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut poll_fds = [PollFd::new(bfd, PollFlags::POLLIN)];
-    let poll_result = poll(&mut poll_fds, PollTimeout::from(1000u16))
-        .map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
-    if poll_result == 0 {
-        let _ = unistd::close(fd);
-        return Err(ProbeError::Timeout);
-    }
+    send(fd.raw(), Tag::Info, &[]).map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
 
     let mut sb = SocketBuffer::new();
-    let n = sb.read(fd).map_err(|e| {
-        let _ = unistd::close(fd);
-        ProbeError::Unexpected(format!("{}", e))
-    })?;
-    if n == 0 {
-        let _ = unistd::close(fd);
-        return Err(ProbeError::Unexpected("connection closed".into()));
-    }
 
-    while let Some((tag, payload)) = sb.next() {
-        if tag == Tag::Info && payload.len() == std::mem::size_of::<Info>() {
-            let info: Info = unsafe { std::ptr::read(payload.as_ptr() as *const Info) };
-            return Ok(ProbeResult { fd, info });
+    for _ in 0..10 {
+        let bfd = unsafe { BorrowedFd::borrow_raw(fd.raw()) };
+        let mut poll_fds = [PollFd::new(bfd, PollFlags::POLLIN)];
+        let poll_result = poll(&mut poll_fds, PollTimeout::from(1000u16))
+            .map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
+        if poll_result == 0 {
+            return Err(ProbeError::Timeout);
+        }
+
+        let n = sb.read(fd.raw())
+            .map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
+        if n == 0 {
+            return Err(ProbeError::Unexpected("connection closed".into()));
+        }
+
+        while let Some((tag, payload)) = sb.next() {
+            if tag == Tag::Info && payload.len() == std::mem::size_of::<Info>() {
+                let info: Info = unsafe { std::ptr::read(payload.as_ptr() as *const Info) };
+                return Ok(ProbeResult { fd, info });
+            }
         }
     }
 
-    let _ = unistd::close(fd);
     Err(ProbeError::Unexpected("no info response".into()))
 }

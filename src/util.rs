@@ -54,7 +54,7 @@ pub fn get_session_entries(socket_dir: &Path) -> io::Result<Vec<SessionEntry>> {
 
         match ipc::probe_session(path_str) {
             Ok(result) => {
-                let _ = unsafe { libc::close(result.fd) };
+                drop(result.fd);
 
                 let cmd_len = (result.info.cmd_len as usize).min(MAX_CMD_LEN);
                 let cwd_len = (result.info.cwd_len as usize).min(MAX_CWD_LEN);
@@ -186,6 +186,67 @@ pub fn write_session_line(
         }
     }
     writeln!(w)
+}
+
+// -- Session resolution helpers -----------------------------------------------
+
+pub fn resolve_sessions(
+    socket_dir: &std::path::Path,
+    names: &[String],
+) -> Result<Vec<String>, String> {
+    let prefix = socket::session_prefix();
+    let patterns: Vec<String> = names.iter().map(|n| format!("{}{}", prefix, n)).collect();
+    let has_glob = patterns.iter().any(|p| p.ends_with('*'));
+
+    if !has_glob {
+        return Ok(patterns);
+    }
+
+    let entries = get_session_entries(socket_dir)
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                "no sessions found".to_string()
+            } else {
+                format!("{}", e)
+            }
+        })?;
+
+    let matching: Vec<String> = entries.iter()
+        .filter(|e| pattern_matches(&patterns, &e.name))
+        .map(|e| e.name.clone())
+        .collect();
+
+    if matching.is_empty() {
+        return Err("no matching sessions found".into());
+    }
+    Ok(matching)
+}
+
+pub fn pattern_matches(patterns: &[String], name: &str) -> bool {
+    patterns.iter().any(|p| {
+        if let Some(stem) = p.strip_suffix('*') {
+            name.starts_with(stem)
+        } else {
+            name == p
+        }
+    })
+}
+
+pub fn session_connect_by_name(name: &str) -> Result<ipc::OwnedFd, String> {
+    let prefix = socket::session_prefix();
+    let session_name = socket::get_session_name(&prefix, name)
+        .map_err(|e| format!("{}", e))?;
+    let socket_dir = socket::socket_dir();
+    let socket_path = socket::get_socket_path(&socket_dir, &session_name)
+        .map_err(|_| {
+            socket::print_session_name_too_long(&session_name, &socket_dir);
+            "socket path too long".to_string()
+        })?;
+    let path_str = socket_path.to_str()
+        .ok_or("invalid socket path")?;
+    let fd = socket::session_connect(path_str)
+        .map_err(|e| format!("cannot connect to session '{}': {}", name, e))?;
+    Ok(ipc::OwnedFd(fd))
 }
 
 // -- Shell quoting ------------------------------------------------------------
