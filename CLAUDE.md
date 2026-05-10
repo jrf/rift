@@ -37,8 +37,6 @@ Single `poll()` over: signal pipe, server socket, PTY master, all client fds. Ha
 - **DA query drain** — Immediately after PTY spawn, daemon polls the master for up to 2s responding to DA1/DA2 queries. This prevents fish shell's 2-second timeout warning. Early output is preserved and fed to the parser.
 - **First-attach skip** — `has_had_client` flag: Init (terminal state) is only sent on re-attach, not first attach, to avoid interfering with shell startup.
 - **Detach key** — Ctrl+\ (0x1c). VQUIT is disabled in raw mode so the byte reaches the client instead of generating SIGQUIT.
-- **Wire-compatible with zmx** — Same IPC protocol (tag enum values, header format) as the Zig-based zmx project.
-
 ### PTY Spawn Flow
 
 `spawn_pty()` calls `libc::forkpty()`. Child sets `RIF_SESSION` env var, resets SIGPIPE, execs shell as login shell (`-fish`, `-zsh`, etc.). Shell is detected via `RIF_SHELL` > `SHELL` > `/bin/sh`.
