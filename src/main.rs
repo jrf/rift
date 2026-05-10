@@ -82,11 +82,17 @@ fn parse_args() -> Command {
             Command::Kill { name: args[1].clone() }
         }
         "detach" | "d" => {
-            if args.len() < 2 {
-                eprintln!("error: detach requires a session name");
-                std::process::exit(1);
-            }
-            Command::Detach { name: args[1].clone() }
+            let name = if args.len() >= 2 {
+                args[1].clone()
+            } else {
+                let env = socket::session_name_from_env();
+                if env.is_empty() {
+                    eprintln!("error: detach requires a session name");
+                    std::process::exit(1);
+                }
+                env
+            };
+            Command::Detach { name }
         }
         "run" => {
             if args.len() < 2 {
@@ -724,12 +730,12 @@ impl Daemon {
                 Some(r) => r,
                 None => continue,
             };
-            if revents.contains(PollFlags::POLLHUP) || revents.contains(PollFlags::POLLERR) {
+            if revents.contains(PollFlags::POLLERR) {
                 log::info!("client disconnected (poll error), fd={}", self.clients[i].fd);
                 remove.push(i);
                 continue;
             }
-            if !revents.contains(PollFlags::POLLIN) {
+            if !revents.contains(PollFlags::POLLIN) && !revents.contains(PollFlags::POLLHUP) {
                 continue;
             }
 
@@ -1031,6 +1037,7 @@ fn run_client(socket_fd: RawFd) -> i32 {
 fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: RawFd) -> i32 {
     let mut socket_buf = SocketBuffer::new();
     let mut exit_code: i32 = 0;
+    let mut detached = false;
 
     loop {
         let stdin_bfd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
@@ -1095,6 +1102,7 @@ fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: R
                                     let _ = write_all_raw(stdout_fd, &payload);
                                 }
                                 Tag::Detach => {
+                                    detached = true;
                                     break;
                                 }
                                 Tag::Ack => {
@@ -1111,6 +1119,10 @@ fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: R
                     Err(_) => break,
                 }
             }
+        }
+
+        if detached {
+            break;
         }
     }
 
