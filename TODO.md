@@ -3,11 +3,6 @@
 ## Now
 
 ## Next
-- [ ] `print` — inject text into session display without PTY input #feature
-- [ ] `write` — pipe stdin to a file via session (base64 chunked) #feature
-- [ ] `attach <session> <command>` — spawn specific command instead of login shell #feature
-- [ ] `run --fish` — fish-specific command completion detection #improvement
-- [ ] `RIF_DIR_MODE` / `RIF_LOG_MODE` — permission modes for socket dirs and log files #feature
 
 ## Later
 
@@ -35,3 +30,11 @@
 - [x] `detach` without args uses `RIF_SESSION` from env #improvement
 - [x] Fix: client now exits on daemon-initiated detach (DetachAll) #bug
 - [x] Fix: daemon reads pending data before treating POLLHUP as disconnect #bug
+- [x] `kill` with multiple names and prefix matching (`rif kill dev*`) #improvement
+- [x] `tail` with multiple names and prefix matching (`rif tail dev*`) #improvement
+- [x] `RIF_SESSION_PREFIX` applied to `kill` and `tail` #improvement
+- [x] `print` — inject text into session display without PTY input #feature
+- [x] `write` — pipe stdin to a file via session (base64 chunked) #feature
+- [x] `attach <session> <command>` — spawn specific command instead of login shell #feature
+- [x] `run --fish` — fish-specific command completion detection #improvement
+- [x] `RIF_DIR_MODE` / `RIF_LOG_MODE` — permission modes for socket dirs and log files #feature

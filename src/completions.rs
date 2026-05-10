@@ -16,7 +16,7 @@ const BASH: &str = r#"_rif_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="attach new run send tail detach list completions kill history wait version help"
+  local commands="attach new run send print write tail detach list completions kill history wait version help"
 
   if [[ $COMP_CWORD -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -24,7 +24,7 @@ const BASH: &str = r#"_rif_completions() {
   fi
 
   case "$prev" in
-    attach|a|new|n|run|r|send|s|tail|t|kill|k|history|hi|detach|d|wait|w)
+    attach|a|new|n|run|r|send|s|print|p|write|wr|tail|t|kill|k|history|hi|detach|d|wait|w)
       local sessions=$(rif list --short 2>/dev/null | tr '\n' ' ')
       COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
       ;;
@@ -60,6 +60,8 @@ const ZSH: &str = r#"_rif() {
         'new:Create session without attaching'
         'run:Run a command in a session'
         'send:Send keystrokes to a session'
+        'print:Inject text into session display'
+        'write:Write stdin to a file in the session'
         'tail:Follow session output in real-time'
         'detach:Detach all clients from a session'
         'list:List active sessions'
@@ -74,7 +76,7 @@ const ZSH: &str = r#"_rif() {
       ;;
     args)
       case $words[2] in
-        attach|a|new|n|kill|k|run|r|send|s|tail|t|detach|d|history|hi|wait|w)
+        attach|a|new|n|kill|k|run|r|send|s|print|p|write|wr|tail|t|detach|d|history|hi|wait|w)
           _rif_sessions
           ;;
         completions)
@@ -110,6 +112,8 @@ complete -c rif -n "__fish_is_nth_token 1" -a 'a attach' -d 'Attach to session, 
 complete -c rif -n "__fish_is_nth_token 1" -a 'n new' -d 'Create session without attaching'
 complete -c rif -n "__fish_is_nth_token 1" -a 'r run' -d 'Run a command in a session'
 complete -c rif -n "__fish_is_nth_token 1" -a 's send' -d 'Send keystrokes to a session'
+complete -c rif -n "__fish_is_nth_token 1" -a 'p print' -d 'Inject text into session display'
+complete -c rif -n "__fish_is_nth_token 1" -a 'wr write' -d 'Write stdin to a file in the session'
 complete -c rif -n "__fish_is_nth_token 1" -a 't tail' -d 'Follow session output in real-time'
 complete -c rif -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from a session'
 complete -c rif -n "__fish_is_nth_token 1" -a 'l ls list' -d 'List active sessions'
@@ -122,7 +126,7 @@ complete -c rif -s V -l version -d 'Print version'
 complete -c rif -n "__fish_is_nth_token 1" -a 'h help' -d 'Print help'
 complete -c rif -s h -d 'Print help'
 
-complete -c rif -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s tail t kill k detach d history hi wait w" -a '(rif list --short 2>/dev/null)' -d 'Session name'
+complete -c rif -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w" -a '(rif list --short 2>/dev/null)' -d 'Session name'
 
 complete -c rif -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish' -d Shell
 
@@ -131,5 +135,6 @@ complete -c rif -n "__fish_seen_subcommand_from history hi" -l vt -d 'VT escape 
 complete -c rif -n "__fish_seen_subcommand_from history hi" -l html -d 'HTML format'
 complete -c rif -n "__fish_seen_subcommand_from attach a" -s d -l detached -d 'Create without attaching'
 complete -c rif -n "__fish_seen_subcommand_from run r" -s d -l detached -d 'Run detached (background)'
+complete -c rif -n "__fish_seen_subcommand_from run r" -l fish -d 'Use fish shell completion detection'
 complete -c rif -n "__fish_seen_subcommand_from kill k" -s f -l force -d 'Force kill (SIGKILL)'
 "#;

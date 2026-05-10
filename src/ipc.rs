@@ -20,6 +20,10 @@ pub enum Tag {
     History = 8,
     Run = 9,
     Ack = 10,
+    Switch = 11,
+    Write = 12,
+    TaskComplete = 13,
+    Print = 14,
 }
 
 impl Tag {
@@ -36,6 +40,10 @@ impl Tag {
             8 => Some(Tag::History),
             9 => Some(Tag::Run),
             10 => Some(Tag::Ack),
+            11 => Some(Tag::Switch),
+            12 => Some(Tag::Write),
+            13 => Some(Tag::TaskComplete),
+            14 => Some(Tag::Print),
             _ => None,
         }
     }

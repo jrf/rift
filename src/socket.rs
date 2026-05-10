@@ -229,10 +229,23 @@ pub fn ensure_dirs(socket_dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(socket_dir)?;
     std::fs::create_dir_all(socket_dir.join("logs"))?;
     use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o750);
-    let _ = std::fs::set_permissions(socket_dir, perms.clone());
-    let _ = std::fs::set_permissions(socket_dir.join("logs"), perms);
+    let dir_mode = parse_mode_env("RIF_DIR_MODE", 0o750);
+    let log_mode = parse_mode_env("RIF_LOG_MODE", 0o640);
+    let _ = std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(dir_mode));
+    let _ = std::fs::set_permissions(socket_dir.join("logs"), std::fs::Permissions::from_mode(dir_mode));
+    // Apply log mode to existing log files
+    if let Ok(entries) = std::fs::read_dir(socket_dir.join("logs")) {
+        for entry in entries.flatten() {
+            let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(log_mode));
+        }
+    }
     Ok(())
+}
+
+fn parse_mode_env(name: &str, default: u32) -> u32 {
+    std::env::var(name).ok()
+        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0o").trim_start_matches("0"), 8).ok())
+        .unwrap_or(default)
 }
 
 fn close_fd(fd: RawFd) {
