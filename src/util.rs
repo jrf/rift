@@ -107,6 +107,20 @@ pub fn get_session_entries(socket_dir: &Path) -> io::Result<Vec<SessionEntry>> {
                     task_exit_code: Some(1),
                 });
             }
+            Err(ipc::ProbeError::Timeout) => {
+                sessions.push(SessionEntry {
+                    name,
+                    pid: None,
+                    clients_len: None,
+                    is_error: true,
+                    error_name: Some("Timeout".into()),
+                    cmd: None,
+                    cwd: None,
+                    created_at: 0,
+                    task_ended_at: Some(0),
+                    task_exit_code: Some(1),
+                });
+            }
             Err(e) => {
                 let err_name = format!("{}", e);
                 sessions.push(SessionEntry {

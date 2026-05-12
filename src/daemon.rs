@@ -722,6 +722,11 @@ pub fn run_client(socket_fd: RawFd) -> i32 {
     let stdin_fd: RawFd = 0;
     let stdout_fd: RawFd = 1;
 
+    if let Err(e) = set_nonblock_and_cloexec(socket_fd) {
+        eprintln!("error: failed to set socket nonblock: {}", e);
+        return 1;
+    }
+
     let saved = match enter_raw_mode(stdin_fd) {
         Ok(s) => s,
         Err(e) => {

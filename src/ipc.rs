@@ -238,7 +238,7 @@ pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
     for _ in 0..10 {
         let bfd = unsafe { BorrowedFd::borrow_raw(fd.raw()) };
         let mut poll_fds = [PollFd::new(bfd, PollFlags::POLLIN)];
-        let poll_result = poll(&mut poll_fds, PollTimeout::from(1000u16))
+        let poll_result = poll(&mut poll_fds, PollTimeout::from(200u16))
             .map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
         if poll_result == 0 {
             return Err(ProbeError::Timeout);
