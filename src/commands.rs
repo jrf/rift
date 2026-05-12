@@ -181,7 +181,7 @@ pub fn cmd_history(name: &str, format: util::HistoryFormat) -> i32 {
                 while let Some((tag, payload)) = socket_buf.next() {
                     if tag == Tag::History {
                         if !payload.is_empty() {
-                            let _ = daemon::write_all_raw(stdout_fd, &payload);
+                            let _ = ipc::write_all(stdout_fd, &payload);
                         }
                         return 0;
                     }
@@ -313,7 +313,7 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
                 Err(_) => {
                     socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
                     match daemon::spawn_daemon(&cfg, &[]) {
-                        Ok(fd) => OwnedFd(fd),
+                        Ok(fd) => fd,
                         Err(e) => { eprintln!("error: {}", e); return 1; }
                     }
                 }
@@ -321,7 +321,7 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
         }
         Ok(false) => {
             match daemon::spawn_daemon(&cfg, &[]) {
-                Ok(fd) => OwnedFd(fd),
+                Ok(fd) => fd,
                 Err(e) => { eprintln!("error: {}", e); return 1; }
             }
         }
@@ -374,7 +374,7 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
                 while let Some((tag, payload)) = socket_buf.next() {
                     match tag {
                         Tag::Output => {
-                            let _ = daemon::write_all_raw(stdout_fd, &payload);
+                            let _ = ipc::write_all(stdout_fd, &payload);
                         }
                         Tag::Ack => {
                             return if payload.is_empty() { 0 } else { payload[0] as i32 };
@@ -565,7 +565,7 @@ pub fn cmd_tail(names: &[String]) -> i32 {
                 Ok(_) => {
                     while let Some((tag, payload)) = bufs[i].next() {
                         if tag == Tag::Output {
-                            let _ = daemon::write_all_raw(stdout_fd, &payload);
+                            let _ = ipc::write_all(stdout_fd, &payload);
                         }
                     }
                 }
@@ -647,5 +647,5 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
         Err(e) => { eprintln!("error: {}", e); return 1; }
     };
 
-    daemon::run_client(socket_fd)
+    daemon::run_client(socket_fd.raw())
 }

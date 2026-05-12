@@ -127,7 +127,7 @@ pub fn send(fd: RawFd, tag: Tag, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn write_all(fd: RawFd, data: &[u8]) -> io::Result<()> {
+pub fn write_all(fd: RawFd, data: &[u8]) -> io::Result<()> {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
     let mut offset = 0;
     while offset < data.len() {
