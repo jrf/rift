@@ -120,11 +120,10 @@ fn decode_header(data: &[u8]) -> (u8, u32) {
 
 pub fn send(fd: RawFd, tag: Tag, data: &[u8]) -> io::Result<()> {
     let header = encode_header(tag, data.len() as u32);
-    write_all(fd, &header)?;
-    if !data.is_empty() {
-        write_all(fd, data)?;
-    }
-    Ok(())
+    let mut msg = Vec::with_capacity(HEADER_SIZE + data.len());
+    msg.extend_from_slice(&header);
+    msg.extend_from_slice(data);
+    write_all(fd, &msg)
 }
 
 pub fn write_all(fd: RawFd, data: &[u8]) -> io::Result<()> {
@@ -138,6 +137,7 @@ pub fn write_all(fd: RawFd, data: &[u8]) -> io::Result<()> {
                 }
                 offset += n;
             }
+            Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
         }
     }

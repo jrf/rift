@@ -158,6 +158,21 @@ impl Drop for RawModeGuard {
     }
 }
 
+struct NonBlockGuard {
+    fd: RawFd,
+}
+
+impl Drop for NonBlockGuard {
+    fn drop(&mut self) {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let bfd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        if let Ok(fl) = fcntl(&bfd, FcntlArg::F_GETFL) {
+            let fl = OFlag::from_bits_truncate(fl) & !OFlag::O_NONBLOCK;
+            let _ = fcntl(&bfd, FcntlArg::F_SETFL(fl));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DA query drain
 // ---------------------------------------------------------------------------
@@ -727,6 +742,12 @@ pub fn run_client(socket_fd: RawFd) -> i32 {
         return 1;
     }
 
+    if let Err(e) = set_nonblock_and_cloexec(stdout_fd) {
+        eprintln!("error: failed to set stdout nonblock: {}", e);
+        return 1;
+    }
+    let _stdout_guard = NonBlockGuard { fd: stdout_fd };
+
     let saved = match enter_raw_mode(stdin_fd) {
         Ok(s) => s,
         Err(e) => {
@@ -752,26 +773,52 @@ pub fn run_client(socket_fd: RawFd) -> i32 {
     client_loop(socket_fd, sig_read, stdin_fd, stdout_fd)
 }
 
+fn drain_output(fd: RawFd, buf: &mut Vec<u8>) {
+    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+    while !buf.is_empty() {
+        match unistd::write(&bfd, buf) {
+            Ok(n) if n > 0 => { buf.drain(..n); }
+            Err(nix::errno::Errno::EINTR) => continue,
+            _ => break,
+        }
+    }
+}
+
 fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: RawFd) -> i32 {
     let mut socket_buf = SocketBuffer::new();
+    let mut out_buf: Vec<u8> = Vec::new();
     let mut exit_code: i32 = 0;
     let mut detached = false;
+    const MAX_OUT_BUF: usize = 4 * 1024 * 1024;
 
     loop {
         let stdin_bfd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
         let sock_bfd = unsafe { BorrowedFd::borrow_raw(socket_fd) };
         let sig_bfd = unsafe { BorrowedFd::borrow_raw(signal_fd) };
 
-        let mut poll_fds = [
+        let has_pending_output = !out_buf.is_empty();
+        let mut poll_fds = vec![
             PollFd::new(stdin_bfd, PollFlags::POLLIN),
             PollFd::new(sock_bfd, PollFlags::POLLIN),
             PollFd::new(sig_bfd, PollFlags::POLLIN),
         ];
+        if has_pending_output {
+            let out_bfd = unsafe { BorrowedFd::borrow_raw(stdout_fd) };
+            poll_fds.push(PollFd::new(out_bfd, PollFlags::POLLOUT));
+        }
 
         match poll(&mut poll_fds, PollTimeout::NONE) {
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => break,
+        }
+
+        if has_pending_output {
+            if let Some(revents) = poll_fds[3].revents() {
+                if revents.contains(PollFlags::POLLOUT) {
+                    drain_output(stdout_fd, &mut out_buf);
+                }
+            }
         }
 
         if let Some(revents) = poll_fds[2].revents() {
@@ -812,7 +859,11 @@ fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: R
                         while let Some((tag, payload)) = socket_buf.next() {
                             match tag {
                                 Tag::Output | Tag::Init => {
-                                    let _ = ipc::write_all(stdout_fd, &payload);
+                                    if out_buf.len() + payload.len() > MAX_OUT_BUF {
+                                        let excess = out_buf.len() + payload.len() - MAX_OUT_BUF;
+                                        out_buf.drain(..excess.min(out_buf.len()));
+                                    }
+                                    out_buf.extend_from_slice(&payload);
                                 }
                                 Tag::Detach => {
                                     detached = true;
@@ -822,11 +873,13 @@ fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: R
                                     if !payload.is_empty() {
                                         exit_code = payload[0] as i32;
                                     }
+                                    drain_output(stdout_fd, &mut out_buf);
                                     return exit_code;
                                 }
                                 _ => {}
                             }
                         }
+                        drain_output(stdout_fd, &mut out_buf);
                     }
                     Err(nix::errno::Errno::EAGAIN) => {}
                     Err(_) => break,
@@ -839,6 +892,7 @@ fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: R
         }
     }
 
+    drain_output(stdout_fd, &mut out_buf);
     exit_code
 }
 
