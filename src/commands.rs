@@ -1,12 +1,12 @@
 use std::io;
-use std::os::unix::io::{BorrowedFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::Signal;
 
 use crate::daemon::{self, Cfg};
-use crate::ipc::{self, Tag, SocketBuffer, OwnedFd};
+use crate::ipc::{self, Tag, SocketBuffer};
 use crate::socket;
 use crate::util;
 
@@ -57,16 +57,15 @@ fn kill_one(socket_dir: &Path, session_name: &str, force: bool) -> i32 {
         Ok(result) => {
             let pid = result.info.pid;
             if !force {
-                let _ = ipc::send(result.fd.raw(), Tag::Kill, &[]);
+                let _ = ipc::send(result.fd.as_raw_fd(), Tag::Kill, &[]);
             }
             Some(pid)
         }
         Err(_) => {
             if !force {
                 match socket::session_connect(path_str) {
-                    Ok(raw_fd) => {
-                        let fd = ipc::OwnedFd(raw_fd);
-                        let _ = ipc::send(fd.raw(), Tag::Kill, &[]);
+                    Ok(fd) => {
+                        let _ = ipc::send(fd.as_raw_fd(), Tag::Kill, &[]);
                     }
                     Err(e) => {
                         if e.kind() == io::ErrorKind::ConnectionRefused {
@@ -137,7 +136,7 @@ pub fn cmd_detach(name: &str) -> i32 {
         Ok(fd) => fd,
         Err(e) => { eprintln!("error: {}", e); return 1; }
     };
-    if let Err(e) = ipc::send(fd.raw(), Tag::DetachAll, &[]) {
+    if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::DetachAll, &[]) {
         eprintln!("error: failed to send detach: {}", e);
         return 1;
     }
@@ -155,7 +154,7 @@ pub fn cmd_history(name: &str, format: util::HistoryFormat) -> i32 {
     };
 
     let format_byte = format as u8;
-    if let Err(e) = ipc::send(fd.raw(), Tag::History, &[format_byte]) {
+    if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::History, &[format_byte]) {
         eprintln!("error: failed to send history request: {}", e);
         return 1;
     }
@@ -165,7 +164,7 @@ pub fn cmd_history(name: &str, format: util::HistoryFormat) -> i32 {
     let stdout_fd: RawFd = 1;
 
     loop {
-        let sock_bfd = unsafe { BorrowedFd::borrow_raw(fd.raw()) };
+        let sock_bfd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
         let mut poll_fds = [PollFd::new(sock_bfd, PollFlags::POLLIN)];
 
         match poll(&mut poll_fds, PollTimeout::from(5000u16)) {
@@ -175,13 +174,13 @@ pub fn cmd_history(name: &str, format: util::HistoryFormat) -> i32 {
             Err(_) => break,
         }
 
-        match socket_buf.read(fd.raw()) {
+        match socket_buf.read(fd.as_raw_fd()) {
             Ok(0) => break,
             Ok(_) => {
                 while let Some((tag, payload)) = socket_buf.next() {
                     if tag == Tag::History {
                         if !payload.is_empty() {
-                            let _ = ipc::write_all(stdout_fd, &payload);
+                            let _ = ipc::write_all(stdout_fd, payload);
                         }
                         return 0;
                     }
@@ -306,10 +305,10 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
         None => { eprintln!("error: invalid socket path"); return 1; }
     };
 
-    let socket_fd = match socket::session_exists(&cfg.socket_dir, &cfg.session_name) {
+    let socket_fd: OwnedFd = match socket::session_exists(&cfg.socket_dir, &cfg.session_name) {
         Ok(true) => {
             match socket::session_connect(&path_str) {
-                Ok(fd) => OwnedFd(fd),
+                Ok(fd) => fd,
                 Err(_) => {
                     socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
                     match daemon::spawn_daemon(&cfg, &[]) {
@@ -345,7 +344,7 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
         format!("{}; printf 'RIF_TASK_COMPLETED:%d' $?\n", cmd_str)
     };
 
-    if let Err(e) = ipc::send(socket_fd.raw(), Tag::Run, wrapped.as_bytes()) {
+    if let Err(e) = ipc::send(socket_fd.as_raw_fd(), Tag::Run, wrapped.as_bytes()) {
         eprintln!("error: failed to send command: {}", e);
         return 1;
     }
@@ -359,7 +358,7 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
     let stdout_fd: RawFd = 1;
 
     loop {
-        let sock_bfd = unsafe { BorrowedFd::borrow_raw(socket_fd.raw()) };
+        let sock_bfd = unsafe { BorrowedFd::borrow_raw(socket_fd.as_raw_fd()) };
         let mut poll_fds = [PollFd::new(sock_bfd, PollFlags::POLLIN)];
 
         match poll(&mut poll_fds, PollTimeout::NONE) {
@@ -368,13 +367,13 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
             Err(_) => break,
         }
 
-        match socket_buf.read(socket_fd.raw()) {
+        match socket_buf.read(socket_fd.as_raw_fd()) {
             Ok(0) => break,
             Ok(_) => {
                 while let Some((tag, payload)) = socket_buf.next() {
                     match tag {
                         Tag::Output => {
-                            let _ = ipc::write_all(stdout_fd, &payload);
+                            let _ = ipc::write_all(stdout_fd, payload);
                         }
                         Tag::Ack => {
                             return if payload.is_empty() { 0 } else { payload[0] as i32 };
@@ -412,7 +411,7 @@ pub fn cmd_send(name: &str, text_args: &[String]) -> i32 {
         text_args.join(" ").into_bytes()
     };
 
-    if let Err(e) = ipc::send(fd.raw(), Tag::Input, &data) {
+    if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::Input, &data) {
         eprintln!("error: failed to send: {}", e);
         return 1;
     }
@@ -442,7 +441,7 @@ pub fn cmd_print(name: &str, text_args: &[String]) -> i32 {
         s.into_bytes()
     };
 
-    if let Err(e) = ipc::send(fd.raw(), Tag::Print, &data) {
+    if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::Print, &data) {
         eprintln!("error: failed to send: {}", e);
         return 1;
     }
@@ -485,7 +484,7 @@ pub fn cmd_write(name: &str, path: &str) -> i32 {
         } else {
             format!("printf '{}' | base64 -d >> {}\n", encoded, util::shell_quote(path))
         };
-        if let Err(e) = ipc::send(fd.raw(), Tag::Input, cmd.as_bytes()) {
+        if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::Input, cmd.as_bytes()) {
             eprintln!("error: failed to send chunk: {}", e);
             return 1;
         }
@@ -523,7 +522,7 @@ pub fn cmd_tail(names: &[String]) -> i32 {
         };
         match socket::session_connect(path_str) {
             Ok(fd) => {
-                fds.push(OwnedFd(fd));
+                fds.push(fd);
                 bufs.push(SocketBuffer::new());
             }
             Err(e) => { eprintln!("error: cannot connect to session '{}': {}", name, e); }
@@ -540,7 +539,7 @@ pub fn cmd_tail(names: &[String]) -> i32 {
     loop {
         let mut poll_fds: Vec<PollFd> = fds.iter()
             .map(|fd| {
-                let bfd = unsafe { BorrowedFd::borrow_raw(fd.raw()) };
+                let bfd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
                 PollFd::new(bfd, PollFlags::POLLIN)
             })
             .collect();
@@ -560,12 +559,12 @@ pub fn cmd_tail(names: &[String]) -> i32 {
             if !revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
                 continue;
             }
-            match bufs[i].read(fds[i].raw()) {
+            match bufs[i].read(fds[i].as_raw_fd()) {
                 Ok(0) => { closed.push(i); }
                 Ok(_) => {
                     while let Some((tag, payload)) = bufs[i].next() {
                         if tag == Tag::Output {
-                            let _ = ipc::write_all(stdout_fd, &payload);
+                            let _ = ipc::write_all(stdout_fd, payload);
                         }
                     }
                 }
@@ -627,6 +626,7 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
                     socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
                 }
             }
+
         }
         Ok(false) => {}
         Err(e) => {
@@ -647,5 +647,5 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
         Err(e) => { eprintln!("error: {}", e); return 1; }
     };
 
-    daemon::run_client(socket_fd.raw())
+    daemon::run_client(socket_fd)
 }

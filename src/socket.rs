@@ -1,5 +1,5 @@
 use std::io;
-use std::os::unix::io::{BorrowedFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use nix::fcntl::{FdFlag, OFlag, fcntl, FcntlArg};
@@ -139,7 +139,7 @@ fn set_nonblock(fd: RawFd) -> io::Result<()> {
 }
 
 /// Create a non-blocking Unix domain socket, bind, and listen.
-pub fn create_socket(path: &Path) -> io::Result<RawFd> {
+pub fn create_socket(path: &Path) -> io::Result<OwnedFd> {
     let owned_fd = nix_socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -147,31 +147,20 @@ pub fn create_socket(path: &Path) -> io::Result<RawFd> {
         None,
     )
     .map_err(io_err)?;
-    let fd = owned_fd.into_raw_fd();
+    let fd = owned_fd.as_raw_fd();
 
-    set_cloexec(fd).map_err(|e| { close_fd(fd); e })?;
-    set_nonblock(fd).map_err(|e| { close_fd(fd); e })?;
+    set_cloexec(fd)?;
+    set_nonblock(fd)?;
 
-    let addr = UnixAddr::new(path).map_err(|e| {
-        close_fd(fd);
-        io_err(e)
-    })?;
+    let addr = UnixAddr::new(path).map_err(io_err)?;
+    bind(fd, &addr).map_err(io_err)?;
+    listen(&owned_fd, Backlog::new(128).unwrap()).map_err(io_err)?;
 
-    bind(fd, &addr).map_err(|e| {
-        close_fd(fd);
-        io_err(e)
-    })?;
-
-    listen(&unsafe { borrow(fd) }, Backlog::new(128).unwrap()).map_err(|e| {
-        close_fd(fd);
-        io_err(e)
-    })?;
-
-    Ok(fd)
+    Ok(owned_fd)
 }
 
 /// Connect to an existing session's Unix socket (blocking, cloexec).
-pub fn session_connect(socket_path: &str) -> io::Result<RawFd> {
+pub fn session_connect(socket_path: &str) -> io::Result<OwnedFd> {
     let owned_fd = nix_socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -179,21 +168,14 @@ pub fn session_connect(socket_path: &str) -> io::Result<RawFd> {
         None,
     )
     .map_err(io_err)?;
-    let fd = owned_fd.into_raw_fd();
+    let fd = owned_fd.as_raw_fd();
 
-    set_cloexec(fd).map_err(|e| { close_fd(fd); e })?;
+    set_cloexec(fd)?;
 
-    let addr = UnixAddr::new(socket_path).map_err(|e| {
-        close_fd(fd);
-        io_err(e)
-    })?;
+    let addr = UnixAddr::new(socket_path).map_err(io_err)?;
+    connect(fd, &addr).map_err(io_err)?;
 
-    connect(fd, &addr).map_err(|e| {
-        close_fd(fd);
-        io_err(e)
-    })?;
-
-    Ok(fd)
+    Ok(owned_fd)
 }
 
 /// Check if a session socket exists at the given path.
@@ -246,10 +228,6 @@ fn parse_mode_env(name: &str, default: u32) -> u32 {
     std::env::var(name).ok()
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0o").trim_start_matches("0"), 8).ok())
         .unwrap_or(default)
-}
-
-fn close_fd(fd: RawFd) {
-    unsafe { libc::close(fd); }
 }
 
 fn io_err(e: nix::errno::Errno) -> io::Error {

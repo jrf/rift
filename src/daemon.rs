@@ -1,5 +1,5 @@
 use std::io;
-use std::os::unix::io::{BorrowedFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,15 +41,6 @@ impl Cfg {
 // ---------------------------------------------------------------------------
 // Raw helpers
 // ---------------------------------------------------------------------------
-
-pub fn size_as_bytes(r: &ipc::Resize) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            r as *const ipc::Resize as *const u8,
-            std::mem::size_of::<ipc::Resize>(),
-        )
-    }
-}
 
 pub fn read_raw(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -267,9 +258,49 @@ pub fn spawn_pty(cmd: &str, args: &[&str], rows: u16, cols: u16, session_name: &
 // Daemon
 // ---------------------------------------------------------------------------
 
+/// Per-client outgoing buffer cap. Above this, the client is dropped on the
+/// next send to prevent unbounded growth from a stalled reader.
+const MAX_OUT_BUF: usize = 4 * 1024 * 1024;
+
 struct ClientConn {
-    fd: ipc::OwnedFd,
+    fd: OwnedFd,
     buf: SocketBuffer,
+    out_buf: Vec<u8>,
+}
+
+impl ClientConn {
+    /// Append a message to out_buf. Returns false if the buffer would exceed
+    /// MAX_OUT_BUF — caller should remove the client.
+    fn queue_send(&mut self, tag: Tag, data: &[u8]) -> bool {
+        let total = ipc::HEADER_SIZE + data.len();
+        if self.out_buf.len() + total > MAX_OUT_BUF {
+            return false;
+        }
+        let header = ipc::encode_header(tag, data.len() as u32);
+        self.out_buf.extend_from_slice(&header);
+        self.out_buf.extend_from_slice(data);
+        true
+    }
+
+    /// Drain out_buf via non-blocking write. Returns false on permanent error
+    /// (caller should remove the client). EAGAIN leaves remainder queued.
+    fn flush(&mut self) -> bool {
+        let bfd = unsafe { BorrowedFd::borrow_raw(self.fd.as_raw_fd()) };
+        while !self.out_buf.is_empty() {
+            match unistd::write(&bfd, &self.out_buf) {
+                Ok(0) => return false,
+                Ok(n) => { self.out_buf.drain(..n); }
+                Err(nix::errno::Errno::EAGAIN) => return true,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    fn wants_write(&self) -> bool {
+        !self.out_buf.is_empty()
+    }
 }
 
 pub struct Daemon {
@@ -292,47 +323,47 @@ pub struct Daemon {
 impl Daemon {
     fn broadcast(&mut self, tag: Tag, data: &[u8]) {
         let mut remove = Vec::new();
-        for (i, client) in self.clients.iter().enumerate() {
-            if ipc::send(client.fd.raw(), tag, data).is_err() {
+        for (i, client) in self.clients.iter_mut().enumerate() {
+            if !client.queue_send(tag, data) {
                 remove.push(i);
             }
         }
         for i in remove.into_iter().rev() {
             let c = self.clients.remove(i);
-            log::info!("client disconnected (write error), fd={}", c.fd.raw());
+            log::info!("client disconnected (out buffer full), fd={}", c.fd.as_raw_fd());
+        }
+    }
+
+    /// Opportunistically drain out_bufs after each event loop iteration so
+    /// data goes out promptly without waiting for the next poll round.
+    fn flush_clients(&mut self) {
+        let mut remove = Vec::new();
+        for (i, client) in self.clients.iter_mut().enumerate() {
+            if client.wants_write() && !client.flush() {
+                remove.push(i);
+            }
+        }
+        for i in remove.into_iter().rev() {
+            let c = self.clients.remove(i);
+            log::info!("client disconnected (write error), fd={}", c.fd.as_raw_fd());
         }
     }
 
     fn build_info(&self) -> ipc::Info {
-        let mut info: ipc::Info = unsafe { std::mem::zeroed() };
-        info.clients_len = self.clients.len();
-        info.pid = self.child_pid;
-        info.created_at = self.created_at;
-        info.task_ended_at = self.task_ended_at;
-        info.task_exit_code = self.task_exit_code;
-
-        let cmd_bytes = self.shell_cmd.as_bytes();
-        let cmd_len = cmd_bytes.len().min(ipc::MAX_CMD_LEN);
-        info.cmd[..cmd_len].copy_from_slice(&cmd_bytes[..cmd_len]);
-        info.cmd_len = cmd_len as u16;
-
-        let cwd_bytes = self.cwd.as_bytes();
-        let cwd_len = cwd_bytes.len().min(ipc::MAX_CWD_LEN);
-        info.cwd[..cwd_len].copy_from_slice(&cwd_bytes[..cwd_len]);
-        info.cwd_len = cwd_len as u16;
-
-        info
+        ipc::Info {
+            clients_len: self.clients.len(),
+            pid: self.child_pid,
+            created_at: self.created_at,
+            task_ended_at: self.task_ended_at,
+            task_exit_code: self.task_exit_code,
+            cmd: self.shell_cmd.as_bytes().to_vec(),
+            cwd: self.cwd.as_bytes().to_vec(),
+        }
     }
 
-    fn send_info(&self, fd: RawFd) {
-        let info = self.build_info();
-        let data = unsafe {
-            std::slice::from_raw_parts(
-                &info as *const ipc::Info as *const u8,
-                std::mem::size_of::<ipc::Info>(),
-            )
-        };
-        let _ = ipc::send(fd, Tag::Info, data);
+    fn send_info(&mut self, i: usize) {
+        let payload = self.build_info().encode();
+        let _ = self.clients[i].queue_send(Tag::Info, &payload);
     }
 
     fn handle_signal(&mut self) -> bool {
@@ -362,24 +393,27 @@ impl Daemon {
             if r < 0 {
                 break;
             }
-            let client_fd = ipc::OwnedFd(r);
-            if let Err(e) = set_nonblock_and_cloexec(client_fd.raw()) {
+            let client_fd = unsafe { OwnedFd::from_raw_fd(r) };
+            if let Err(e) = set_nonblock_and_cloexec(client_fd.as_raw_fd()) {
                 log::warn!("failed to set flags on client fd: {}", e);
                 continue;
             }
-            log::info!("client connected, fd={}", client_fd.raw());
+            log::info!("client connected, fd={}", client_fd.as_raw_fd());
+
+            let mut client = ClientConn {
+                fd: client_fd,
+                buf: SocketBuffer::new(),
+                out_buf: Vec::new(),
+            };
 
             if self.has_had_client {
                 if let Some(state) = util::serialize_terminal_state(&self.parser) {
-                    let _ = ipc::send(client_fd.raw(), Tag::Init, &state);
+                    let _ = client.queue_send(Tag::Init, &state);
                 }
             }
             self.has_had_client = true;
 
-            self.clients.push(ClientConn {
-                fd: client_fd,
-                buf: SocketBuffer::new(),
-            });
+            self.clients.push(client);
         }
     }
 
@@ -430,7 +464,12 @@ impl Daemon {
                 None => continue,
             };
             if revents.contains(PollFlags::POLLERR) {
-                log::info!("client disconnected (poll error), fd={}", self.clients[i].fd.raw());
+                log::info!("client disconnected (poll error), fd={}", self.clients[i].fd.as_raw_fd());
+                remove.push(i);
+                continue;
+            }
+            if revents.contains(PollFlags::POLLOUT) && !self.clients[i].flush() {
+                log::info!("client disconnected (write error), fd={}", self.clients[i].fd.as_raw_fd());
                 remove.push(i);
                 continue;
             }
@@ -438,7 +477,7 @@ impl Daemon {
                 continue;
             }
 
-            let client_fd = self.clients[i].fd.raw();
+            let client_fd = self.clients[i].fd.as_raw_fd();
             match self.clients[i].buf.read(client_fd) {
                 Ok(0) => {
                     log::info!("client disconnected, fd={}", client_fd);
@@ -454,15 +493,13 @@ impl Daemon {
             }
 
             while let Some((tag, payload)) = self.clients[i].buf.next() {
+                let payload = payload.to_vec();
                 match tag {
                     Tag::Input => {
                         let _ = ipc::write_all(self.pty_master_fd, &payload);
                     }
                     Tag::Resize => {
-                        if payload.len() == std::mem::size_of::<ipc::Resize>() {
-                            let resize: ipc::Resize = unsafe {
-                                std::ptr::read(payload.as_ptr() as *const ipc::Resize)
-                            };
+                        if let Some(resize) = ipc::Resize::decode(&payload) {
                             self.parser.screen_mut().set_size(resize.rows, resize.cols);
                             let ws = libc::winsize {
                                 ws_row: resize.rows,
@@ -477,13 +514,13 @@ impl Daemon {
                     }
                     Tag::Detach => {
                         log::info!("client requested detach, fd={}", client_fd);
-                        let _ = ipc::send(client_fd, Tag::Detach, &[]);
+                        let _ = self.clients[i].queue_send(Tag::Detach, &[]);
                         remove.push(i);
                     }
                     Tag::DetachAll => {
                         log::info!("client requested detach-all");
                         for j in 0..self.clients.len() {
-                            let _ = ipc::send(self.clients[j].fd.raw(), Tag::Detach, &[]);
+                            let _ = self.clients[j].queue_send(Tag::Detach, &[]);
                         }
                         remove.clear();
                         for j in 0..self.clients.len() {
@@ -496,7 +533,7 @@ impl Daemon {
                         unsafe { libc::kill(self.child_pid, libc::SIGTERM); }
                     }
                     Tag::Info => {
-                        self.send_info(client_fd);
+                        self.send_info(i);
                     }
                     Tag::History => {
                         let format = if payload.is_empty() {
@@ -508,11 +545,8 @@ impl Daemon {
                                 _ => util::HistoryFormat::Plain,
                             }
                         };
-                        if let Some(data) = util::serialize_terminal(&self.parser, format) {
-                            let _ = ipc::send(client_fd, Tag::History, &data);
-                        } else {
-                            let _ = ipc::send(client_fd, Tag::History, &[]);
-                        }
+                        let data = util::serialize_terminal(&self.parser, format).unwrap_or_default();
+                        let _ = self.clients[i].queue_send(Tag::History, &data);
                     }
                     Tag::Print => {
                         if !payload.is_empty() {
@@ -551,8 +585,13 @@ fn daemon_loop(daemon: &mut Daemon) {
         ];
 
         for client in &daemon.clients {
-            let bfd = unsafe { BorrowedFd::borrow_raw(client.fd.raw()) };
-            poll_fds.push(PollFd::new(bfd, PollFlags::POLLIN));
+            let bfd = unsafe { BorrowedFd::borrow_raw(client.fd.as_raw_fd()) };
+            let flags = if client.wants_write() {
+                PollFlags::POLLIN | PollFlags::POLLOUT
+            } else {
+                PollFlags::POLLIN
+            };
+            poll_fds.push(PollFd::new(bfd, flags));
         }
 
         match poll(&mut poll_fds, PollTimeout::NONE) {
@@ -585,6 +624,7 @@ fn daemon_loop(daemon: &mut Daemon) {
         }
 
         daemon.handle_client_data(&poll_fds[3..]);
+        daemon.flush_clients();
 
         if daemon.child_exited {
             let _ = daemon.handle_pty_output();
@@ -667,8 +707,9 @@ pub fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
 
     log::info!("daemon exiting, session={}", daemon.session_name);
 
-    for c in &daemon.clients {
-        let _ = ipc::send(c.fd.raw(), Tag::Detach, &[]);
+    for c in daemon.clients.iter_mut() {
+        let _ = c.queue_send(Tag::Detach, &[]);
+        let _ = c.flush();
     }
     daemon.clients.clear();
 
@@ -681,8 +722,9 @@ pub fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
 }
 
 fn fork_daemon(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
-    let server_fd = socket::create_socket(&cfg.socket_path)
+    let server_owned = socket::create_socket(&cfg.socket_path)
         .map_err(|e| format!("failed to create socket: {}", e))?;
+    let server_fd = server_owned.into_raw_fd();
 
     let cmd_owned: Vec<String> = cmd.to_vec();
     let pid = unsafe { libc::fork() };
@@ -703,7 +745,7 @@ fn fork_daemon(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn spawn_daemon(cfg: &Cfg, cmd: &[String]) -> Result<ipc::OwnedFd, String> {
+pub fn spawn_daemon(cfg: &Cfg, cmd: &[String]) -> Result<OwnedFd, String> {
     fork_daemon(cfg, cmd)?;
 
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -713,7 +755,7 @@ pub fn spawn_daemon(cfg: &Cfg, cmd: &[String]) -> Result<ipc::OwnedFd, String> {
 
     for i in 0..10 {
         match socket::session_connect(path_str) {
-            Ok(fd) => return Ok(ipc::OwnedFd(fd)),
+            Ok(fd) => return Ok(fd),
             Err(_) if i < 9 => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -733,7 +775,8 @@ pub fn spawn_daemon_detached(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
 // Client
 // ---------------------------------------------------------------------------
 
-pub fn run_client(socket_fd: RawFd) -> i32 {
+pub fn run_client(socket: OwnedFd) -> i32 {
+    let socket_fd = socket.as_raw_fd();
     let stdin_fd: RawFd = 0;
     let stdout_fd: RawFd = 1;
 
@@ -768,7 +811,7 @@ pub fn run_client(socket_fd: RawFd) -> i32 {
     install_signal_handler(Signal::SIGWINCH);
 
     let size = ipc::get_terminal_size(stdout_fd);
-    let _ = ipc::send(socket_fd, Tag::Resize, size_as_bytes(&size));
+    let _ = ipc::send(socket_fd, Tag::Resize, &size.encode());
 
     client_loop(socket_fd, sig_read, stdin_fd, stdout_fd)
 }
@@ -826,7 +869,7 @@ fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: R
                 let mut buf = [0u8; 64];
                 let _ = read_raw(signal_fd, &mut buf);
                 let size = ipc::get_terminal_size(stdout_fd);
-                let _ = ipc::send(socket_fd, Tag::Resize, size_as_bytes(&size));
+                let _ = ipc::send(socket_fd, Tag::Resize, &size.encode());
             }
         }
 

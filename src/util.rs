@@ -1,10 +1,10 @@
 use std::io::{self, Write};
-use std::os::unix::io::{BorrowedFd, RawFd};
+use std::os::unix::io::{BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use nix::unistd;
 
-use crate::ipc::{self, MAX_CMD_LEN, MAX_CWD_LEN};
+use crate::ipc;
 use crate::socket;
 
 // -- Session listing ----------------------------------------------------------
@@ -56,15 +56,13 @@ pub fn get_session_entries(socket_dir: &Path) -> io::Result<Vec<SessionEntry>> {
             Ok(result) => {
                 drop(result.fd);
 
-                let cmd_len = (result.info.cmd_len as usize).min(MAX_CMD_LEN);
-                let cwd_len = (result.info.cwd_len as usize).min(MAX_CWD_LEN);
-                let cmd = if cmd_len > 0 {
-                    String::from_utf8_lossy(&result.info.cmd[..cmd_len]).into_owned().into()
+                let cmd = if !result.info.cmd.is_empty() {
+                    Some(String::from_utf8_lossy(&result.info.cmd).into_owned())
                 } else {
                     None
                 };
-                let cwd = if cwd_len > 0 {
-                    String::from_utf8_lossy(&result.info.cwd[..cwd_len]).into_owned().into()
+                let cwd = if !result.info.cwd.is_empty() {
+                    Some(String::from_utf8_lossy(&result.info.cwd).into_owned())
                 } else {
                     None
                 };
@@ -246,7 +244,7 @@ pub fn pattern_matches(patterns: &[String], name: &str) -> bool {
     })
 }
 
-pub fn session_connect_by_name(name: &str) -> Result<ipc::OwnedFd, String> {
+pub fn session_connect_by_name(name: &str) -> Result<OwnedFd, String> {
     let prefix = socket::session_prefix();
     let session_name = socket::get_session_name(&prefix, name)
         .map_err(|e| format!("{}", e))?;
@@ -258,9 +256,8 @@ pub fn session_connect_by_name(name: &str) -> Result<ipc::OwnedFd, String> {
         })?;
     let path_str = socket_path.to_str()
         .ok_or("invalid socket path")?;
-    let fd = socket::session_connect(path_str)
-        .map_err(|e| format!("cannot connect to session '{}': {}", name, e))?;
-    Ok(ipc::OwnedFd(fd))
+    socket::session_connect(path_str)
+        .map_err(|e| format!("cannot connect to session '{}': {}", name, e))
 }
 
 // -- Shell quoting ------------------------------------------------------------
