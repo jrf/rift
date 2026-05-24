@@ -10,7 +10,7 @@ pub fn print_completions(shell: &str) {
     }
 }
 
-const BASH: &str = r#"_rif_completions() {
+const BASH: &str = r#"_rift_completions() {
   local cur prev words cword
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
@@ -25,7 +25,7 @@ const BASH: &str = r#"_rif_completions() {
 
   case "$prev" in
     attach|a|new|n|run|r|send|s|print|p|write|wr|tail|t|kill|k|history|hi|detach|d|wait|w)
-      local sessions=$(rif list --short 2>/dev/null | tr '\n' ' ')
+      local sessions=$(rift list --short 2>/dev/null | tr '\n' ' ')
       COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
       ;;
     completions)
@@ -39,10 +39,10 @@ const BASH: &str = r#"_rif_completions() {
   esac
 }
 
-complete -o bashdefault -o default -F _rif_completions rif
+complete -o bashdefault -o default -F _rift_completions rift
 "#;
 
-const ZSH: &str = r#"_rif() {
+const ZSH: &str = r#"_rift() {
   local context state state_descr line
   typeset -A opt_args
 
@@ -77,7 +77,7 @@ const ZSH: &str = r#"_rif() {
     args)
       case $words[2] in
         attach|a|new|n|kill|k|run|r|send|s|print|p|write|wr|tail|t|detach|d|history|hi|wait|w)
-          _rif_sessions
+          _rift_sessions
           ;;
         completions)
           _values 'shell' 'bash' 'zsh' 'fish'
@@ -92,10 +92,10 @@ const ZSH: &str = r#"_rif() {
   esac
 }
 
-_rif_sessions() {
+_rift_sessions() {
   local -a sessions
 
-  local local_sessions=$(rif list --short 2>/dev/null)
+  local local_sessions=$(rift list --short 2>/dev/null)
   if [[ -n "$local_sessions" ]]; then
     sessions+=(${(f)local_sessions})
   fi
@@ -103,38 +103,38 @@ _rif_sessions() {
   _describe 'local session' sessions
 }
 
-compdef _rif rif
+compdef _rift rift
 "#;
 
-const FISH: &str = r#"complete -c rif -f
+const FISH: &str = r#"complete -c rift -f
 
-complete -c rif -n "__fish_is_nth_token 1" -a 'a attach' -d 'Attach to session, creating if needed'
-complete -c rif -n "__fish_is_nth_token 1" -a 'n new' -d 'Create session without attaching'
-complete -c rif -n "__fish_is_nth_token 1" -a 'r run' -d 'Run a command in a session'
-complete -c rif -n "__fish_is_nth_token 1" -a 's send' -d 'Send keystrokes to a session'
-complete -c rif -n "__fish_is_nth_token 1" -a 'p print' -d 'Inject text into session display'
-complete -c rif -n "__fish_is_nth_token 1" -a 'wr write' -d 'Write stdin to a file in the session'
-complete -c rif -n "__fish_is_nth_token 1" -a 't tail' -d 'Follow session output in real-time'
-complete -c rif -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from a session'
-complete -c rif -n "__fish_is_nth_token 1" -a 'l ls list' -d 'List active sessions'
-complete -c rif -n "__fish_is_nth_token 1" -a 'c completions' -d 'Print shell completion script'
-complete -c rif -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
-complete -c rif -n "__fish_is_nth_token 1" -a 'hi history' -d 'Print session output'
-complete -c rif -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for sessions to complete'
-complete -c rif -n "__fish_is_nth_token 1" -a 'v version' -d 'Print version'
-complete -c rif -s V -l version -d 'Print version'
-complete -c rif -n "__fish_is_nth_token 1" -a 'h help' -d 'Print help'
-complete -c rif -s h -d 'Print help'
+complete -c rift -n "__fish_is_nth_token 1" -a 'a attach' -d 'Attach to session, creating if needed'
+complete -c rift -n "__fish_is_nth_token 1" -a 'n new' -d 'Create session without attaching'
+complete -c rift -n "__fish_is_nth_token 1" -a 'r run' -d 'Run a command in a session'
+complete -c rift -n "__fish_is_nth_token 1" -a 's send' -d 'Send keystrokes to a session'
+complete -c rift -n "__fish_is_nth_token 1" -a 'p print' -d 'Inject text into session display'
+complete -c rift -n "__fish_is_nth_token 1" -a 'wr write' -d 'Write stdin to a file in the session'
+complete -c rift -n "__fish_is_nth_token 1" -a 't tail' -d 'Follow session output in real-time'
+complete -c rift -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from a session'
+complete -c rift -n "__fish_is_nth_token 1" -a 'l ls list' -d 'List active sessions'
+complete -c rift -n "__fish_is_nth_token 1" -a 'c completions' -d 'Print shell completion script'
+complete -c rift -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
+complete -c rift -n "__fish_is_nth_token 1" -a 'hi history' -d 'Print session output'
+complete -c rift -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for sessions to complete'
+complete -c rift -n "__fish_is_nth_token 1" -a 'v version' -d 'Print version'
+complete -c rift -s V -l version -d 'Print version'
+complete -c rift -n "__fish_is_nth_token 1" -a 'h help' -d 'Print help'
+complete -c rift -s h -d 'Print help'
 
-complete -c rif -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w" -a '(rif list --short 2>/dev/null)' -d 'Session name'
+complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w" -a '(rift list --short 2>/dev/null)' -d 'Session name'
 
-complete -c rif -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish' -d Shell
+complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish' -d Shell
 
-complete -c rif -n "__fish_seen_subcommand_from list ls l" -l short -s s -d 'Short output'
-complete -c rif -n "__fish_seen_subcommand_from history hi" -l vt -d 'VT escape sequence format'
-complete -c rif -n "__fish_seen_subcommand_from history hi" -l html -d 'HTML format'
-complete -c rif -n "__fish_seen_subcommand_from attach a" -s d -l detached -d 'Create without attaching'
-complete -c rif -n "__fish_seen_subcommand_from run r" -s d -l detached -d 'Run detached (background)'
-complete -c rif -n "__fish_seen_subcommand_from run r" -l fish -d 'Use fish shell completion detection'
-complete -c rif -n "__fish_seen_subcommand_from kill k" -s f -l force -d 'Force kill (SIGKILL)'
+complete -c rift -n "__fish_seen_subcommand_from list ls l" -l short -s s -d 'Short output'
+complete -c rift -n "__fish_seen_subcommand_from history hi" -l vt -d 'VT escape sequence format'
+complete -c rift -n "__fish_seen_subcommand_from history hi" -l html -d 'HTML format'
+complete -c rift -n "__fish_seen_subcommand_from attach a" -s d -l detached -d 'Create without attaching'
+complete -c rift -n "__fish_seen_subcommand_from run r" -s d -l detached -d 'Run detached (background)'
+complete -c rift -n "__fish_seen_subcommand_from run r" -l fish -d 'Use fish shell completion detection'
+complete -c rift -n "__fish_seen_subcommand_from kill k" -s f -l force -d 'Force kill (SIGKILL)'
 "#;

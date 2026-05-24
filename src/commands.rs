@@ -203,7 +203,7 @@ pub fn cmd_wait(names: &[String]) -> i32 {
 
     let patterns: Vec<String> = if names.is_empty() {
         if prefix.is_empty() {
-            eprintln!("error: wait requires session names or RIF_SESSION_PREFIX");
+            eprintln!("error: wait requires session names or RIFT_SESSION_PREFIX");
             return 1;
         }
         vec![prefix.clone()]
@@ -339,9 +339,9 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
         .join(" ");
 
     let wrapped = if fish {
-        format!("{}; printf 'RIF_TASK_COMPLETED:%d' $status\n", cmd_str)
+        format!("{}; printf 'RIFT_TASK_COMPLETED:%d' $status\n", cmd_str)
     } else {
-        format!("{}; printf 'RIF_TASK_COMPLETED:%d' $?\n", cmd_str)
+        format!("{}; printf 'RIFT_TASK_COMPLETED:%d' $?\n", cmd_str)
     };
 
     if let Err(e) = ipc::send(socket_fd.as_raw_fd(), Tag::Run, wrapped.as_bytes()) {

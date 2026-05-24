@@ -14,12 +14,12 @@ run:
 
 # Install to ~/.local/bin
 install: release
-    cp target/release/rif ~/.local/bin/
-    codesign -s - ~/.local/bin/rif
+    cp target/release/rift ~/.local/bin/
+    codesign -s - ~/.local/bin/rift
 
 # Uninstall from ~/.local/bin
 uninstall:
-    rm -f ~/.local/bin/rif
+    rm -f ~/.local/bin/rift
 
 # Remove build artifacts
 clean:

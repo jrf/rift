@@ -202,7 +202,7 @@ fn main() {
     let cmd = parse_args();
     let code = match cmd {
         Command::Help => { print_help(); 0 }
-        Command::Version => { println!("rif {}", env!("CARGO_PKG_VERSION")); 0 }
+        Command::Version => { println!("rift {}", env!("CARGO_PKG_VERSION")); 0 }
         Command::List { short } => commands::cmd_list(short),
         Command::Kill { names, force } => commands::cmd_kill(&names, force),
         Command::Detach { name } => commands::cmd_detach(&name),
@@ -222,26 +222,26 @@ fn main() {
 fn print_help() {
     println!(
         "\
-rif — terminal session daemon
+rift — terminal session daemon
 
 Usage:
-  rif <session>                Attach to (or create) a session
-  rif attach|a <session>       Same as above (optional <cmd> to run instead of shell)
-  rif attach -d <session>      Create session without attaching
-  rif new|n <session>          Same as attach -d
-  rif list|ls|l [-s]           List sessions (-s for short format)
-  rif run|r <session> <cmd...> Run a command in a session (-d, --fish)
-  rif send|s <session> <text>  Send keystrokes to a session
-  rif print|p <session> <text> Inject text into session display
-  rif write|wr <session> <path> Write stdin to a file in the session
-  rif tail|t <name>...         Follow session output in real-time
-  rif history|hi <session>     Print session output (--vt, --html)
-  rif detach|d [<session>]     Detach all clients from a session
-  rif kill|k <name>...         Kill sessions (-f to force)
-  rif wait|w <name>...         Wait for sessions to complete
-  rif completions|c <shell>    Print shell completions (bash, zsh, fish)
-  rif version|v                Print version
-  rif help|h                   Print this help
+  rift <session>                Attach to (or create) a session
+  rift attach|a <session>       Same as above (optional <cmd> to run instead of shell)
+  rift attach -d <session>      Create session without attaching
+  rift new|n <session>          Same as attach -d
+  rift list|ls|l [-s]           List sessions (-s for short format)
+  rift run|r <session> <cmd...> Run a command in a session (-d, --fish)
+  rift send|s <session> <text>  Send keystrokes to a session
+  rift print|p <session> <text> Inject text into session display
+  rift write|wr <session> <path> Write stdin to a file in the session
+  rift tail|t <name>...         Follow session output in real-time
+  rift history|hi <session>     Print session output (--vt, --html)
+  rift detach|d [<session>]     Detach all clients from a session
+  rift kill|k <name>...         Kill sessions (-f to force)
+  rift wait|w <name>...         Wait for sessions to complete
+  rift completions|c <shell>    Print shell completions (bash, zsh, fish)
+  rift version|v                Print version
+  rift help|h                   Print this help
 
 Detach key: Ctrl+\\"
     );

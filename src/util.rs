@@ -297,7 +297,7 @@ const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c";
 const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c";
 
 /// Scan PTY output for DA queries and respond on behalf of the terminal.
-/// Handles the case where no client is attached (e.g. rif run) and the shell
+/// Handles the case where no client is attached (e.g. rift run) and the shell
 /// sends a DA query that would otherwise go unanswered.
 pub fn respond_to_device_attributes(pty_fd: RawFd, data: &[u8]) {
     let bfd = unsafe { BorrowedFd::borrow_raw(pty_fd) };
@@ -321,7 +321,7 @@ pub fn respond_to_device_attributes(pty_fd: RawFd, data: &[u8]) {
 
 // -- Task exit markers --------------------------------------------------------
 
-const TASK_MARKER: &str = "RIF_TASK_COMPLETED:";
+const TASK_MARKER: &str = "RIFT_TASK_COMPLETED:";
 
 pub fn find_task_exit_marker(output: &[u8]) -> Option<u8> {
     let marker = TASK_MARKER.as_bytes();
@@ -426,7 +426,7 @@ fn serialize_html(screen: &vt100::Screen) -> Vec<u8> {
 // -- Shell detection ----------------------------------------------------------
 
 pub fn detect_shell() -> String {
-    std::env::var("RIF_SHELL")
+    std::env::var("RIFT_SHELL")
         .or_else(|_| std::env::var("SHELL"))
         .unwrap_or_else(|_| "/bin/sh".into())
 }

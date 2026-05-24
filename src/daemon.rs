@@ -219,7 +219,7 @@ pub fn spawn_pty(cmd: &str, args: &[&str], rows: u16, cols: u16, session_name: &
 
     if pid == 0 {
         unsafe {
-            let key = std::ffi::CString::new("RIF_SESSION").unwrap();
+            let key = std::ffi::CString::new("RIFT_SESSION").unwrap();
             let val = std::ffi::CString::new(session_name).unwrap();
             libc::setenv(key.as_ptr(), val.as_ptr(), 1);
 

@@ -13,11 +13,11 @@ use nix::sys::stat::SFlag;
 pub const MAX_SOCKET_PATH_LEN: usize = 104 - 1; // macOS sockaddr_un.sun_path is 104
 
 pub fn session_prefix() -> String {
-    std::env::var("RIF_SESSION_PREFIX").unwrap_or_default()
+    std::env::var("RIFT_SESSION_PREFIX").unwrap_or_default()
 }
 
 pub fn session_name_from_env() -> String {
-    std::env::var("RIF_SESSION").unwrap_or_default()
+    std::env::var("RIFT_SESSION").unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -49,18 +49,18 @@ pub fn get_session_name(prefix: &str, name: &str) -> Result<String, SessionNameE
 }
 
 /// Resolve the socket directory.
-/// Priority: RIF_DIR > XDG_RUNTIME_DIR/rif > TMPDIR/rif-{uid}
+/// Priority: RIFT_DIR > XDG_RUNTIME_DIR/rift > TMPDIR/rift-{uid}
 pub fn socket_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("RIF_DIR") {
+    if let Ok(dir) = std::env::var("RIFT_DIR") {
         return PathBuf::from(dir);
     }
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(xdg).join("rif");
+        return PathBuf::from(xdg).join("rift");
     }
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let tmpdir = tmpdir.trim_end_matches('/');
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("{}/rif-{}", tmpdir, uid))
+    PathBuf::from(format!("{}/rift-{}", tmpdir, uid))
 }
 
 #[derive(Debug)]
@@ -211,8 +211,8 @@ pub fn ensure_dirs(socket_dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(socket_dir)?;
     std::fs::create_dir_all(socket_dir.join("logs"))?;
     use std::os::unix::fs::PermissionsExt;
-    let dir_mode = parse_mode_env("RIF_DIR_MODE", 0o750);
-    let log_mode = parse_mode_env("RIF_LOG_MODE", 0o640);
+    let dir_mode = parse_mode_env("RIFT_DIR_MODE", 0o750);
+    let log_mode = parse_mode_env("RIFT_LOG_MODE", 0o640);
     let _ = std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(dir_mode));
     let _ = std::fs::set_permissions(socket_dir.join("logs"), std::fs::Permissions::from_mode(dir_mode));
     // Apply log mode to existing log files
