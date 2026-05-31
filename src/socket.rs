@@ -2,10 +2,9 @@ use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use nix::fcntl::{FdFlag, OFlag, fcntl, FcntlArg};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::sys::socket::{
-    self as nix_socket, AddressFamily, SockFlag, SockType, UnixAddr,
-    bind, connect, listen, Backlog,
+    self as nix_socket, bind, connect, listen, AddressFamily, Backlog, SockFlag, SockType, UnixAddr,
 };
 use nix::sys::stat::SFlag;
 
@@ -214,22 +213,40 @@ pub fn ensure_dirs(socket_dir: &Path) -> io::Result<()> {
     let dir_mode = parse_mode_env("RIFT_DIR_MODE", 0o750);
     let log_mode = parse_mode_env("RIFT_LOG_MODE", 0o640);
     let _ = std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(dir_mode));
-    let _ = std::fs::set_permissions(socket_dir.join("logs"), std::fs::Permissions::from_mode(dir_mode));
+    let _ = std::fs::set_permissions(
+        socket_dir.join("logs"),
+        std::fs::Permissions::from_mode(dir_mode),
+    );
     // Apply log mode to existing log files
     if let Ok(entries) = std::fs::read_dir(socket_dir.join("logs")) {
         for entry in entries.flatten() {
-            let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(log_mode));
+            let _ =
+                std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(log_mode));
         }
     }
     Ok(())
 }
 
 fn parse_mode_env(name: &str, default: u32) -> u32 {
-    std::env::var(name).ok()
-        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0o").trim_start_matches("0"), 8).ok())
+    std::env::var(name)
+        .ok()
+        .and_then(|s| {
+            u32::from_str_radix(s.trim_start_matches("0o").trim_start_matches("0"), 8).ok()
+        })
         .unwrap_or(default)
 }
 
 fn io_err(e: nix::errno::Errno) -> io::Error {
     io::Error::from_raw_os_error(e as i32)
+}
+
+/// Update the SSH_AUTH_SOCK symlink to point to the client's active agent socket.
+pub fn update_ssh_auth_sock_symlink(socket_dir: &Path, session_name: &str, target_path: &str) {
+    let symlink_path = socket_dir.join(format!("{}.ssh-auth-sock", session_name));
+    if symlink_path.exists() || symlink_path.is_symlink() {
+        let _ = std::fs::remove_file(&symlink_path);
+    }
+    if !target_path.is_empty() {
+        let _ = std::os::unix::fs::symlink(target_path, &symlink_path);
+    }
 }

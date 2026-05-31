@@ -2,7 +2,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd;
 
 use crate::socket;
@@ -26,11 +26,12 @@ pub enum Tag {
     Write = 12,
     TaskComplete = 13,
     Print = 14,
+    SshAuthSock = 15,
 }
 
 impl Tag {
     pub fn from_u8(v: u8) -> Option<Tag> {
-        (v <= Tag::Print as u8).then(|| unsafe { std::mem::transmute::<u8, Tag>(v) })
+        (v <= Tag::SshAuthSock as u8).then(|| unsafe { std::mem::transmute::<u8, Tag>(v) })
     }
 }
 
@@ -264,8 +265,7 @@ pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
         }
     })?;
 
-    send(fd.as_raw_fd(), Tag::Info, &[])
-        .map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
+    send(fd.as_raw_fd(), Tag::Info, &[]).map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
 
     let mut sb = SocketBuffer::new();
     let deadline = Instant::now() + Duration::from_millis(2000);
@@ -285,7 +285,8 @@ pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
             return Err(ProbeError::Timeout);
         }
 
-        let n = sb.read(fd.as_raw_fd())
+        let n = sb
+            .read(fd.as_raw_fd())
             .map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
         if n == 0 {
             return Err(ProbeError::Unexpected("connection closed".into()));

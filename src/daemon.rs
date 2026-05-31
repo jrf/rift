@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::sys::signal::{SigAction, SigHandler, SaFlags, SigSet, Signal, sigaction};
-use nix::sys::termios::{self, Termios, SetArg};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::termios::{self, SetArg, Termios};
 use nix::unistd;
 
-use crate::ipc::{self, Tag, SocketBuffer};
+use crate::ipc::{self, SocketBuffer, Tag};
 use crate::socket;
 use crate::util;
 
@@ -26,15 +26,17 @@ pub struct Cfg {
 impl Cfg {
     pub fn resolve(name: &str) -> Result<Self, String> {
         let prefix = socket::session_prefix();
-        let session_name = socket::get_session_name(&prefix, name)
-            .map_err(|e| format!("{}", e))?;
+        let session_name = socket::get_session_name(&prefix, name).map_err(|e| format!("{}", e))?;
         let socket_dir = socket::socket_dir();
-        let socket_path = socket::get_socket_path(&socket_dir, &session_name)
-            .map_err(|_| {
-                socket::print_session_name_too_long(&session_name, &socket_dir);
-                "socket path too long".to_string()
-            })?;
-        Ok(Cfg { session_name, socket_dir, socket_path })
+        let socket_path = socket::get_socket_path(&socket_dir, &session_name).map_err(|_| {
+            socket::print_session_name_too_long(&session_name, &socket_dir);
+            "socket path too long".to_string()
+        })?;
+        Ok(Cfg {
+            session_name,
+            socket_dir,
+            socket_path,
+        })
     }
 }
 
@@ -62,20 +64,17 @@ fn redirect_std_to_devnull() {
 }
 
 pub fn set_nonblock_and_cloexec(fd: RawFd) -> io::Result<()> {
-    use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
 
-    let fl = fcntl(&bfd, FcntlArg::F_GETFL)
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    let fl = fcntl(&bfd, FcntlArg::F_GETFL).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     let fl = OFlag::from_bits_truncate(fl) | OFlag::O_NONBLOCK;
-    fcntl(&bfd, FcntlArg::F_SETFL(fl))
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    fcntl(&bfd, FcntlArg::F_SETFL(fl)).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
 
-    let fd_flags = fcntl(&bfd, FcntlArg::F_GETFD)
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    let fd_flags =
+        fcntl(&bfd, FcntlArg::F_GETFD).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     let fd_flags = FdFlag::from_bits_truncate(fd_flags) | FdFlag::FD_CLOEXEC;
-    fcntl(&bfd, FcntlArg::F_SETFD(fd_flags))
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    fcntl(&bfd, FcntlArg::F_SETFD(fd_flags)).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
 
     Ok(())
 }
@@ -113,12 +112,16 @@ pub fn install_signal_handler(sig: Signal) {
         SaFlags::SA_RESTART,
         SigSet::empty(),
     );
-    unsafe { let _ = sigaction(sig, &sa); }
+    unsafe {
+        let _ = sigaction(sig, &sa);
+    }
 }
 
 pub fn ignore_signal(sig: Signal) {
     let sa = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-    unsafe { let _ = sigaction(sig, &sa); }
+    unsafe {
+        let _ = sigaction(sig, &sa);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -127,8 +130,7 @@ pub fn ignore_signal(sig: Signal) {
 
 pub fn enter_raw_mode(fd: RawFd) -> io::Result<Termios> {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let saved = termios::tcgetattr(&bfd)
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    let saved = termios::tcgetattr(&bfd).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     let mut raw = saved.clone();
     termios::cfmakeraw(&mut raw);
     raw.control_chars[nix::sys::termios::SpecialCharacterIndices::VQUIT as usize] = 0;
@@ -155,7 +157,7 @@ struct NonBlockGuard {
 
 impl Drop for NonBlockGuard {
     fn drop(&mut self) {
-        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
         let bfd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         if let Ok(fl) = fcntl(&bfd, FcntlArg::F_GETFL) {
             let fl = OFlag::from_bits_truncate(fl) & !OFlag::O_NONBLOCK;
@@ -198,7 +200,13 @@ fn drain_da_queries(master_fd: RawFd) -> Vec<u8> {
 // PTY spawning
 // ---------------------------------------------------------------------------
 
-pub fn spawn_pty(cmd: &str, args: &[&str], rows: u16, cols: u16, session_name: &str) -> io::Result<(RawFd, libc::pid_t)> {
+pub fn spawn_pty(
+    cmd: &str,
+    args: &[&str],
+    rows: u16,
+    cols: u16,
+    session_name: &str,
+) -> io::Result<(RawFd, libc::pid_t)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     ws.ws_row = rows;
     ws.ws_col = cols;
@@ -223,6 +231,14 @@ pub fn spawn_pty(cmd: &str, args: &[&str], rows: u16, cols: u16, session_name: &
             let val = std::ffi::CString::new(session_name).unwrap();
             libc::setenv(key.as_ptr(), val.as_ptr(), 1);
 
+            let sock_dir = socket::socket_dir();
+            let symlink_path = sock_dir.join(format!("{}.ssh-auth-sock", session_name));
+            if let Some(symlink_str) = symlink_path.to_str() {
+                let key_ssh = std::ffi::CString::new("SSH_AUTH_SOCK").unwrap();
+                let val_ssh = std::ffi::CString::new(symlink_str).unwrap();
+                libc::setenv(key_ssh.as_ptr(), val_ssh.as_ptr(), 1);
+            }
+
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
 
             if args.is_empty() {
@@ -241,7 +257,8 @@ pub fn spawn_pty(cmd: &str, args: &[&str], rows: u16, cols: u16, session_name: &
                 for arg in args {
                     argv.push(std::ffi::CString::new(*arg).unwrap());
                 }
-                let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+                let mut argv_ptrs: Vec<*const libc::c_char> =
+                    argv.iter().map(|a| a.as_ptr()).collect();
                 argv_ptrs.push(std::ptr::null());
                 libc::execv(cmd_cstr.as_ptr(), argv_ptrs.as_ptr());
             }
@@ -289,7 +306,9 @@ impl ClientConn {
         while !self.out_buf.is_empty() {
             match unistd::write(&bfd, &self.out_buf) {
                 Ok(0) => return false,
-                Ok(n) => { self.out_buf.drain(..n); }
+                Ok(n) => {
+                    self.out_buf.drain(..n);
+                }
                 Err(nix::errno::Errno::EAGAIN) => return true,
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(_) => return false,
@@ -310,6 +329,7 @@ pub struct Daemon {
     clients: Vec<ClientConn>,
     parser: vt100::Parser,
     session_name: String,
+    socket_dir: PathBuf,
     shell_cmd: String,
     cwd: String,
     created_at: u64,
@@ -318,6 +338,8 @@ pub struct Daemon {
     child_exited: bool,
     has_had_client: bool,
     signal_read_fd: RawFd,
+    last_client_disconnected_at: Option<u64>,
+    empty_timeout: Option<u64>,
 }
 
 impl Daemon {
@@ -330,7 +352,10 @@ impl Daemon {
         }
         for i in remove.into_iter().rev() {
             let c = self.clients.remove(i);
-            log::info!("client disconnected (out buffer full), fd={}", c.fd.as_raw_fd());
+            log::info!(
+                "client disconnected (out buffer full), fd={}",
+                c.fd.as_raw_fd()
+            );
         }
     }
 
@@ -380,16 +405,19 @@ impl Daemon {
                 self.task_exit_code = 1;
             }
             self.task_ended_at = now_epoch();
-            log::info!("child exited, pid={} exit_code={}", self.child_pid, self.task_exit_code);
+            log::info!(
+                "child exited, pid={} exit_code={}",
+                self.child_pid,
+                self.task_exit_code
+            );
         }
         false
     }
 
     fn handle_server(&mut self) {
         loop {
-            let r = unsafe {
-                libc::accept(self.server_fd, std::ptr::null_mut(), std::ptr::null_mut())
-            };
+            let r =
+                unsafe { libc::accept(self.server_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
             if r < 0 {
                 break;
             }
@@ -464,12 +492,18 @@ impl Daemon {
                 None => continue,
             };
             if revents.contains(PollFlags::POLLERR) {
-                log::info!("client disconnected (poll error), fd={}", self.clients[i].fd.as_raw_fd());
+                log::info!(
+                    "client disconnected (poll error), fd={}",
+                    self.clients[i].fd.as_raw_fd()
+                );
                 remove.push(i);
                 continue;
             }
             if revents.contains(PollFlags::POLLOUT) && !self.clients[i].flush() {
-                log::info!("client disconnected (write error), fd={}", self.clients[i].fd.as_raw_fd());
+                log::info!(
+                    "client disconnected (write error), fd={}",
+                    self.clients[i].fd.as_raw_fd()
+                );
                 remove.push(i);
                 continue;
             }
@@ -530,7 +564,9 @@ impl Daemon {
                     }
                     Tag::Kill => {
                         log::info!("kill requested");
-                        unsafe { libc::kill(self.child_pid, libc::SIGTERM); }
+                        unsafe {
+                            libc::kill(self.child_pid, libc::SIGTERM);
+                        }
                     }
                     Tag::Info => {
                         self.send_info(i);
@@ -545,7 +581,8 @@ impl Daemon {
                                 _ => util::HistoryFormat::Plain,
                             }
                         };
-                        let data = util::serialize_terminal(&self.parser, format).unwrap_or_default();
+                        let data =
+                            util::serialize_terminal(&self.parser, format).unwrap_or_default();
                         let _ = self.clients[i].queue_send(Tag::History, &data);
                     }
                     Tag::Print => {
@@ -557,6 +594,17 @@ impl Daemon {
                     Tag::Run => {
                         if !payload.is_empty() {
                             let _ = ipc::write_all(self.pty_master_fd, &payload);
+                        }
+                    }
+                    Tag::SshAuthSock => {
+                        if !payload.is_empty() {
+                            if let Ok(path) = std::str::from_utf8(&payload) {
+                                socket::update_ssh_auth_sock_symlink(
+                                    &self.socket_dir,
+                                    &self.session_name,
+                                    path,
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -594,7 +642,25 @@ fn daemon_loop(daemon: &mut Daemon) {
             poll_fds.push(PollFd::new(bfd, flags));
         }
 
-        match poll(&mut poll_fds, PollTimeout::NONE) {
+        let mut poll_timeout = PollTimeout::NONE;
+        if let (Some(dis_at), Some(limit)) =
+            (daemon.last_client_disconnected_at, daemon.empty_timeout)
+        {
+            let elapsed = now_epoch().saturating_sub(dis_at);
+            if elapsed >= limit {
+                log::info!(
+                    "empty session timeout of {}s reached, self-terminating",
+                    limit
+                );
+                break;
+            } else {
+                let remaining_secs = limit - elapsed;
+                let remaining_ms = std::cmp::min(remaining_secs, 30) * 1000;
+                poll_timeout = PollTimeout::from(remaining_ms as u16);
+            }
+        }
+
+        match poll(&mut poll_fds, poll_timeout) {
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => {
@@ -626,6 +692,14 @@ fn daemon_loop(daemon: &mut Daemon) {
         daemon.handle_client_data(&poll_fds[3..]);
         daemon.flush_clients();
 
+        if daemon.clients.is_empty() {
+            if daemon.has_had_client && daemon.last_client_disconnected_at.is_none() {
+                daemon.last_client_disconnected_at = Some(now_epoch());
+            }
+        } else {
+            daemon.last_client_disconnected_at = None;
+        }
+
         if daemon.child_exited {
             let _ = daemon.handle_pty_output();
             break;
@@ -636,10 +710,23 @@ fn daemon_loop(daemon: &mut Daemon) {
 pub fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     ignore_signal(Signal::SIGPIPE);
 
+    if let Ok(ssh_auth_sock) = std::env::var("SSH_AUTH_SOCK") {
+        socket::update_ssh_auth_sock_symlink(&cfg.socket_dir, &cfg.session_name, &ssh_auth_sock);
+    }
+
+    let empty_timeout = std::env::var("RIFT_EMPTY_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+
     let shell = util::detect_shell();
     let spawn_cmd = if cmd.is_empty() { &shell } else { &cmd[0] };
-    let spawn_args: Vec<&str> = if cmd.is_empty() { vec![] } else { cmd[1..].iter().map(|s| s.as_str()).collect() };
-    let (master_fd, child_pid) = match spawn_pty(spawn_cmd, &spawn_args, 24, 80, &cfg.session_name) {
+    let spawn_args: Vec<&str> = if cmd.is_empty() {
+        vec![]
+    } else {
+        cmd[1..].iter().map(|s| s.as_str()).collect()
+    };
+    let (master_fd, child_pid) = match spawn_pty(spawn_cmd, &spawn_args, 24, 80, &cfg.session_name)
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: failed to spawn pty: {}", e);
@@ -651,7 +738,10 @@ pub fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     let early_output = drain_da_queries(master_fd);
 
     let log_system = Box::leak(Box::new(crate::logger::LogSystem::new()));
-    let log_path = cfg.socket_dir.join("logs").join(format!("{}.log", cfg.session_name));
+    let log_path = cfg
+        .socket_dir
+        .join("logs")
+        .join(format!("{}.log", cfg.session_name));
     if let Err(e) = log_system.init(&log_path) {
         eprintln!("warning: failed to init log: {}", e);
     }
@@ -689,6 +779,7 @@ pub fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
         clients: Vec::new(),
         parser: vt100::Parser::new(24, 80, 1000),
         session_name: cfg.session_name.clone(),
+        socket_dir: cfg.socket_dir.clone(),
         shell_cmd: display_cmd,
         cwd,
         created_at: now_epoch(),
@@ -697,6 +788,8 @@ pub fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
         child_exited: false,
         has_had_client: false,
         signal_read_fd: sig_read,
+        last_client_disconnected_at: None,
+        empty_timeout,
     };
 
     if !early_output.is_empty() {
@@ -719,6 +812,10 @@ pub fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     }
 
     let _ = std::fs::remove_file(&cfg.socket_path);
+    let symlink_path = cfg
+        .socket_dir
+        .join(format!("{}.ssh-auth-sock", cfg.session_name));
+    let _ = std::fs::remove_file(symlink_path);
 }
 
 fn fork_daemon(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
@@ -729,19 +826,27 @@ fn fork_daemon(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
     let cmd_owned: Vec<String> = cmd.to_vec();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        unsafe { libc::close(server_fd); }
+        unsafe {
+            libc::close(server_fd);
+        }
         let _ = std::fs::remove_file(&cfg.socket_path);
         return Err(format!("fork failed: {}", io::Error::last_os_error()));
     }
 
     if pid == 0 {
-        unsafe { libc::setsid(); }
+        unsafe {
+            libc::setsid();
+        }
         redirect_std_to_devnull();
         run_daemon(cfg, server_fd, &cmd_owned);
-        unsafe { libc::_exit(0); }
+        unsafe {
+            libc::_exit(0);
+        }
     }
 
-    unsafe { libc::close(server_fd); }
+    unsafe {
+        libc::close(server_fd);
+    }
     Ok(())
 }
 
@@ -750,8 +855,7 @@ pub fn spawn_daemon(cfg: &Cfg, cmd: &[String]) -> Result<OwnedFd, String> {
 
     std::thread::sleep(std::time::Duration::from_millis(10));
 
-    let path_str = cfg.socket_path.to_str()
-        .ok_or("invalid socket path")?;
+    let path_str = cfg.socket_path.to_str().ok_or("invalid socket path")?;
 
     for i in 0..10 {
         match socket::session_connect(path_str) {
@@ -798,7 +902,10 @@ pub fn run_client(socket: OwnedFd) -> i32 {
             return 1;
         }
     };
-    let _guard = RawModeGuard { fd: stdin_fd, saved };
+    let _guard = RawModeGuard {
+        fd: stdin_fd,
+        saved,
+    };
 
     ignore_signal(Signal::SIGPIPE);
     let (sig_read, _sig_write) = match create_signal_pipe() {
@@ -813,6 +920,10 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     let size = ipc::get_terminal_size(stdout_fd);
     let _ = ipc::send(socket_fd, Tag::Resize, &size.encode());
 
+    if let Ok(ssh_auth_sock) = std::env::var("SSH_AUTH_SOCK") {
+        let _ = ipc::send(socket_fd, Tag::SshAuthSock, ssh_auth_sock.as_bytes());
+    }
+
     client_loop(socket_fd, sig_read, stdin_fd, stdout_fd)
 }
 
@@ -820,7 +931,9 @@ fn drain_output(fd: RawFd, buf: &mut Vec<u8>) {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
     while !buf.is_empty() {
         match unistd::write(&bfd, buf) {
-            Ok(n) if n > 0 => { buf.drain(..n); }
+            Ok(n) if n > 0 => {
+                buf.drain(..n);
+            }
             Err(nix::errno::Errno::EINTR) => continue,
             _ => break,
         }

@@ -214,16 +214,16 @@ pub fn resolve_sessions(
         return Ok(patterns);
     }
 
-    let entries = get_session_entries(socket_dir)
-        .map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                "no sessions found".to_string()
-            } else {
-                format!("{}", e)
-            }
-        })?;
+    let entries = get_session_entries(socket_dir).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            "no sessions found".to_string()
+        } else {
+            format!("{}", e)
+        }
+    })?;
 
-    let matching: Vec<String> = entries.iter()
+    let matching: Vec<String> = entries
+        .iter()
         .filter(|e| pattern_matches(&patterns, &e.name))
         .map(|e| e.name.clone())
         .collect();
@@ -246,16 +246,13 @@ pub fn pattern_matches(patterns: &[String], name: &str) -> bool {
 
 pub fn session_connect_by_name(name: &str) -> Result<OwnedFd, String> {
     let prefix = socket::session_prefix();
-    let session_name = socket::get_session_name(&prefix, name)
-        .map_err(|e| format!("{}", e))?;
+    let session_name = socket::get_session_name(&prefix, name).map_err(|e| format!("{}", e))?;
     let socket_dir = socket::socket_dir();
-    let socket_path = socket::get_socket_path(&socket_dir, &session_name)
-        .map_err(|_| {
-            socket::print_session_name_too_long(&session_name, &socket_dir);
-            "socket path too long".to_string()
-        })?;
-    let path_str = socket_path.to_str()
-        .ok_or("invalid socket path")?;
+    let socket_path = socket::get_socket_path(&socket_dir, &session_name).map_err(|_| {
+        socket::print_session_name_too_long(&session_name, &socket_dir);
+        "socket path too long".to_string()
+    })?;
+    let path_str = socket_path.to_str().ok_or("invalid socket path")?;
     socket::session_connect(path_str)
         .map_err(|e| format!("cannot connect to session '{}': {}", name, e))
 }
@@ -266,11 +263,34 @@ pub fn shell_needs_quoting(arg: &str) -> bool {
     if arg.is_empty() {
         return true;
     }
-    arg.bytes().any(|ch| matches!(ch,
-        b' ' | b'\t' | b'"' | b'\'' | b'\\' | b'$' | b'`' | b'!' |
-        b'(' | b')' | b'{' | b'}' | b'[' | b']' | b'|' | b'&' |
-        b';' | b'<' | b'>' | b'?' | b'*' | b'~' | b'#' | b'\n'
-    ))
+    arg.bytes().any(|ch| {
+        matches!(
+            ch,
+            b' ' | b'\t'
+                | b'"'
+                | b'\''
+                | b'\\'
+                | b'$'
+                | b'`'
+                | b'!'
+                | b'('
+                | b')'
+                | b'{'
+                | b'}'
+                | b'['
+                | b']'
+                | b'|'
+                | b'&'
+                | b';'
+                | b'<'
+                | b'>'
+                | b'?'
+                | b'*'
+                | b'~'
+                | b'#'
+                | b'\n'
+        )
+    })
 }
 
 pub fn shell_quote(arg: &str) -> String {
@@ -311,7 +331,8 @@ pub fn respond_to_device_attributes(pty_fd: RawFd, data: &[u8]) {
             }
             if data[i..].starts_with(DA2_QUERY) || data[i..].starts_with(DA2_QUERY_EXPLICIT) {
                 let _ = unistd::write(&bfd, DA2_RESPONSE);
-            } else if data[i..].starts_with(DA1_QUERY) || data[i..].starts_with(DA1_QUERY_EXPLICIT) {
+            } else if data[i..].starts_with(DA1_QUERY) || data[i..].starts_with(DA1_QUERY_EXPLICIT)
+            {
                 let _ = unistd::write(&bfd, DA1_RESPONSE);
             }
         }
@@ -327,7 +348,10 @@ pub fn find_task_exit_marker(output: &[u8]) -> Option<u8> {
     let marker = TASK_MARKER.as_bytes();
     if let Some(idx) = output.windows(marker.len()).position(|w| w == marker) {
         let after = &output[idx + marker.len()..];
-        let end = after.iter().position(|&b| b == b'\n' || b == b'\r').unwrap_or(after.len());
+        let end = after
+            .iter()
+            .position(|&b| b == b'\n' || b == b'\r')
+            .unwrap_or(after.len());
         let code_str = std::str::from_utf8(&after[..end]).ok()?;
         match code_str.parse::<u8>() {
             Ok(code) => Some(code),
@@ -346,8 +370,7 @@ pub fn find_task_exit_marker(output: &[u8]) -> Option<u8> {
 /// Detects Kitty keyboard protocol escape sequence for Ctrl+\
 /// 92 = backslash, 5 = ctrl modifier, :1 = key press event
 pub fn is_kitty_ctrl_backslash(buf: &[u8]) -> bool {
-    buf.windows(7).any(|w| w == b"\x1b[92;5u")
-        || buf.windows(9).any(|w| w == b"\x1b[92;5:1u")
+    buf.windows(7).any(|w| w == b"\x1b[92;5u") || buf.windows(9).any(|w| w == b"\x1b[92;5:1u")
 }
 
 // -- Terminal serialization (vt100 crate) -------------------------------------

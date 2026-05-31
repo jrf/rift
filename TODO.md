@@ -9,6 +9,7 @@
 ## Scrapped
 
 ## Done
+- [x] SSH agent forwarding socket symlink propagation for multiple SSH sessions #feature
 - [x] Cargo project initialized with deps: nix, vt100, log, env_logger, libc #chore
 - [x] `src/ipc.rs` — IPC protocol (Tag enum, Header, send/recv, SocketBuffer, probe_session) #feature
 - [x] `src/socket.rs` — Unix socket creation/connection, session name validation, path management #feature

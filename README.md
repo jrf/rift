@@ -74,6 +74,13 @@ rift list
 | `RIFT_DIR` | Override the socket directory (default: `$XDG_RUNTIME_DIR/rift` or `$TMPDIR/rift-<uid>`) |
 | `RIFT_DIR_MODE` | Permission mode for socket directory |
 | `RIFT_LOG_MODE` | Permission mode for log files |
+| `RIFT_EMPTY_TIMEOUT` | Idle duration (in seconds) after which a detached session with 0 clients will automatically terminate (e.g., `3600` for 1 hour) |
+
+## SSH Agent Forwarding
+
+When attaching to a session from multiple SSH connections or after reconnecting, `rift` automatically and dynamically updates your `SSH_AUTH_SOCK` pointer. 
+
+When the session is spawned, `rift` configures the shell's `SSH_AUTH_SOCK` to point to a stable symlink in your socket directory (`<socket_dir>/<session_name>.ssh-auth-sock`). Whenever a new `rift` client attaches, it sends its current SSH agent socket, and the daemon updates this symlink to point to the active agent. This allows commands (like `git push`) inside your persistent shell to seamlessly use your active SSH keys.
 
 ## Architecture
 
@@ -101,6 +108,19 @@ wezterm cli split-pane -- rift attach dev.2
 ```bash
 kitty @ launch --type=window --cwd=current rift attach dev.2
 ```
+
+## Integrating with SSH Login
+
+To automatically start or connect to a default `rift` session (e.g., named "main") every time you connect to a server over SSH, you can add the following snippet to your shell configuration (`~/.bashrc`, `~/.zshrc`, or `~/.profile`):
+
+```bash
+# Automatically launch/attach to a default 'rift' session on SSH login
+if [ -n "$SSH_CONNECTION" ] && [ -z "$RIFT_SESSION" ] && command -v rift >/dev/null 2>&1; then
+    exec rift main
+fi
+```
+
+This ensures that when you disconnect or lose your SSH connection, your processes remain running in the background, and the next time you SSH in, you will be immediately reattached to your persistent "main" session.
 
 ## License
 
