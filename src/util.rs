@@ -457,3 +457,63 @@ pub fn detect_shell() -> String {
         .or_else(|_| std::env::var("SHELL"))
         .unwrap_or_else(|_| "/bin/sh".into())
 }
+
+pub fn filter_tail_output(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != 0x1b {
+            out.push(data[i]);
+            i += 1;
+            continue;
+        }
+
+        if i + 1 >= data.len() {
+            // Truncated ESC at end of payload — drop it.
+            break;
+        }
+
+        match data[i + 1] {
+            b'[' => {
+                // CSI: ESC [ params... final (0x40..=0x7E)
+                let mut j = i + 2;
+                while j < data.len() && !(0x40..=0x7E).contains(&data[j]) {
+                    j += 1;
+                }
+                if j >= data.len() {
+                    break;
+                }
+                let final_byte = data[j];
+                if final_byte == b'm' || final_byte == b'K' {
+                    out.extend_from_slice(&data[i..=j]);
+                }
+                i = j + 1;
+            }
+            b']' | b'P' | b'X' | b'^' | b'_' => {
+                // OSC / DCS / SOS / PM / APC: terminated by ST (ESC \) or BEL.
+                let mut j = i + 2;
+                while j < data.len() {
+                    if data[j] == 0x07 {
+                        j += 1;
+                        break;
+                    }
+                    if data[j] == 0x1b && j + 1 < data.len() && data[j + 1] == b'\\' {
+                        j += 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            b'O' => {
+                // SS3: ESC O final
+                i = (i + 3).min(data.len());
+            }
+            _ => {
+                // Other two-byte ESC sequence (ESC =, ESC >, ESC 7/8, ESC D/E/M, ...).
+                i += 2;
+            }
+        }
+    }
+    out
+}

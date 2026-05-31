@@ -537,12 +537,12 @@ pub fn cmd_tail(names: &[String]) -> i32 {
     let stdout_fd: RawFd = 1;
 
     loop {
-        let mut poll_fds: Vec<PollFd> = fds.iter()
-            .map(|fd| {
-                let bfd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
-                PollFd::new(bfd, PollFlags::POLLIN)
-            })
-            .collect();
+        let stdin_bfd = unsafe { BorrowedFd::borrow_raw(0) };
+        let mut poll_fds: Vec<PollFd> = vec![PollFd::new(stdin_bfd, PollFlags::POLLIN)];
+        for fd in &fds {
+            let bfd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+            poll_fds.push(PollFd::new(bfd, PollFlags::POLLIN));
+        }
 
         match poll(&mut poll_fds, PollTimeout::NONE) {
             Ok(_) => {}
@@ -550,9 +550,20 @@ pub fn cmd_tail(names: &[String]) -> i32 {
             Err(_) => break,
         }
 
+        if let Some(revents) = poll_fds[0].revents() {
+            if revents.contains(PollFlags::POLLIN) {
+                let mut buf = [0u8; 128];
+                if let Ok(n) = daemon::read_raw(0, &mut buf) {
+                    if n > 0 && buf[..n].contains(&0x03) {
+                        return 0;
+                    }
+                }
+            }
+        }
+
         let mut closed = Vec::new();
         for i in 0..fds.len() {
-            let revents = match poll_fds[i].revents() {
+            let revents = match poll_fds[i + 1].revents() {
                 Some(r) => r,
                 None => continue,
             };
@@ -564,7 +575,8 @@ pub fn cmd_tail(names: &[String]) -> i32 {
                 Ok(_) => {
                     while let Some((tag, payload)) = bufs[i].next() {
                         if tag == Tag::Output {
-                            let _ = ipc::write_all(stdout_fd, payload);
+                            let filtered = util::filter_tail_output(payload);
+                            let _ = ipc::write_all(stdout_fd, &filtered);
                         }
                     }
                 }
