@@ -9,6 +9,8 @@
 ## Scrapped
 
 ## Done
+- [x] Fix session listing bug where .ssh-auth-sock symlinks were erroneously listed as unreachable sessions #bug
+- [x] Optimize session startup performance (reduced from 2s to ~15ms) by removing busy-waiting in PTY DA query draining #improvement
 - [x] SSH agent forwarding socket symlink propagation for multiple SSH sessions #feature
 - [x] Cargo project initialized with deps: nix, vt100, log, env_logger, libc #chore
 - [x] `src/ipc.rs` — IPC protocol (Tag enum, Header, send/recv, SocketBuffer, probe_session) #feature

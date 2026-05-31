@@ -177,10 +177,10 @@ fn drain_da_queries(master_fd: RawFd) -> Vec<u8> {
     let mut collected = Vec::new();
 
     for _ in 0..200 {
-        match poll(&mut poll_fds, PollTimeout::from(10u16)) {
-            Ok(0) => continue,
+        match poll(&mut poll_fds, PollTimeout::from(2u16)) {
+            Ok(0) => break,
             Ok(_) => {}
-            Err(_) => continue,
+            Err(_) => break,
         }
 
         match read_raw(master_fd, &mut buf) {
@@ -853,15 +853,13 @@ fn fork_daemon(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
 pub fn spawn_daemon(cfg: &Cfg, cmd: &[String]) -> Result<OwnedFd, String> {
     fork_daemon(cfg, cmd)?;
 
-    std::thread::sleep(std::time::Duration::from_millis(10));
-
     let path_str = cfg.socket_path.to_str().ok_or("invalid socket path")?;
 
-    for i in 0..10 {
+    for i in 0..20 {
         match socket::session_connect(path_str) {
             Ok(fd) => return Ok(fd),
-            Err(_) if i < 9 => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+            Err(_) if i < 19 => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(e) => return Err(format!("failed to connect to new session: {}", e)),
         }

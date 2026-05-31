@@ -36,6 +36,10 @@ pub fn get_session_entries(socket_dir: &Path) -> io::Result<Vec<SessionEntry>> {
             Err(_) => continue,
         };
 
+        if name.ends_with(".ssh-auth-sock") {
+            continue;
+        }
+
         // Skip non-socket files (e.g. "logs" directory)
         match socket::session_exists(socket_dir, &name) {
             Ok(true) => {}
