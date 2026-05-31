@@ -48,13 +48,20 @@ pub fn get_session_name(prefix: &str, name: &str) -> Result<String, SessionNameE
 }
 
 /// Resolve the socket directory.
-/// Priority: RIFT_DIR > XDG_RUNTIME_DIR/rift > TMPDIR/rift-{uid}
+/// Priority: RIFT_DIR > XDG_RUNTIME_DIR/rift > $HOME/.local/state/rift > TMPDIR/rift-{uid}
+///
+/// $HOME is preferred over TMPDIR because macOS's TMPDIR varies between
+/// GUI-launched processes (/var/folders/.../T/) and CLI/SSH ones (/tmp), so
+/// using it splits sessions across two socket dirs that never see each other.
 pub fn socket_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("RIFT_DIR") {
         return PathBuf::from(dir);
     }
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         return PathBuf::from(xdg).join("rift");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local").join("state").join("rift");
     }
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let tmpdir = tmpdir.trim_end_matches('/');
