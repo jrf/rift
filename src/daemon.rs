@@ -920,6 +920,13 @@ pub fn run_client(socket: OwnedFd) -> i32 {
         saved,
     };
 
+    // Sanitize the terminal before session bytes start arriving. On reattach,
+    // the daemon will replay the full serialized state (Init), which paints
+    // whatever modes the session actually needs — but it can't reliably
+    // *unset* modes that were sticky on the local terminal (e.g. mouse
+    // tracking left on by fzf), so we start from a known-clean baseline.
+    write_terminal_reset(stdout_fd);
+
     ignore_signal(Signal::SIGPIPE);
     let (sig_read, _sig_write) = match create_signal_pipe() {
         Ok(fds) => fds,
