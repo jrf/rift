@@ -958,6 +958,7 @@ fn write_terminal_reset(fd: RawFd) {
 \x1b[?2004l\
 \x1b[?1049l\x1b[?47l\
 \x1b[0m\
+\x1b[2J\x1b[H\
 \x1b[?25h\
 \x1b>";
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
