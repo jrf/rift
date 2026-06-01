@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Periodic rift layout snapshotter, invoked by launchd. Writes the current
+# kitty rift layout to ~/.local/state/rift/snapshot.kitty if kitty is running.
+# Silently no-ops otherwise (so it's safe to schedule even when kitty is down).
+
+set -uo pipefail
+
+KITTY_SOCKET="${KITTY_LISTEN_ON:-unix:/tmp/kitty-${USER}.sock}"
+KITTEN="/Applications/kitty.app/Contents/MacOS/kitten"
+SNAPSHOT_SCRIPT="${RIFT_SNAPSHOT_SCRIPT:-$HOME/.dotfiles/config/kitty/rift-snapshot.py}"
+OUT="${RIFT_SNAPSHOT_PATH:-$HOME/.local/state/rift/snapshot.kitty}"
+
+pgrep -x kitty >/dev/null || exit 0
+[ -S "${KITTY_SOCKET#unix:}" ] || exit 0
+[ -x "$KITTEN" ] || exit 0
+[ -f "$SNAPSHOT_SCRIPT" ] || exit 0
+
+mkdir -p "$(dirname "$OUT")"
+TMP="$OUT.tmp.$$"
+if "$KITTEN" @ --to="$KITTY_SOCKET" ls 2>/dev/null \
+    | python3 "$SNAPSHOT_SCRIPT" > "$TMP" 2>/dev/null; then
+    mv -f "$TMP" "$OUT"
+else
+    rm -f "$TMP"
+fi

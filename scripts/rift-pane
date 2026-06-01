@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Attach to the next unused rift.<N> session for the current project.
+# Project name comes from $1, falling back to the CWD's basename.
+
+set -uo pipefail
+
+project="${1:-$(basename "$PWD")}"
+project="${project//[^a-zA-Z0-9_-]/-}"
+
+# Find the next free session number, race-free: `rift new` fails if the
+# session already exists, so bump n until creation succeeds. Don't use
+# `set -e` — every `rift new` after the first existing N exits non-zero
+# and would silently kill the script.
+n=0
+while [ $n -lt 100 ]; do
+    name="${project}.${n}"
+    if rift new "$name" >/dev/null 2>&1; then
+        exec rift attach "$name"
+    fi
+    n=$((n + 1))
+done
+
+echo "rift-pane: couldn't allocate a session under '${project}.*'" >&2
+exit 1

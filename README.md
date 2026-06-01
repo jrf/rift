@@ -109,6 +109,16 @@ wezterm cli split-pane -- rift attach dev.2
 kitty @ launch --type=window --cwd=current rift attach dev.2
 ```
 
+### Recipe: keybindings that spawn fresh rift panes (local & SSH)
+
+A drop-in kitty + fish + bash setup that gives you `cmd+shift+t` /
+`cmd+shift+enter` to spawn a new rift-attached pane — locally *or* SSH'd back
+to the host you're already on — plus `rift-restore <host>` for re-establishing
+every remote session after a local reboot.
+
+See [`scripts/README.md`](scripts/README.md) for the full layout, install
+commands, and daily-use table.
+
 ## Integrating with SSH Login
 
 To automatically start or connect to a default `rift` session (e.g., named "main") every time you connect to a server over SSH, you can add the following snippet to your shell configuration (`~/.bashrc`, `~/.zshrc`, or `~/.profile`):
