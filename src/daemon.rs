@@ -147,7 +147,22 @@ pub struct RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let bfd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let _ = termios::tcsetattr(&bfd, SetArg::TCSAFLUSH, &self.saved);
+        // Restore with TCSANOW, not TCSAFLUSH: TCSAFLUSH discards pending
+        // input, which over an SSH PTY (where bytes are often in flight)
+        // can leave the terminal stuck in raw mode after detach. Also OR in
+        // the must-have line-editing bits in case the saved state had them
+        // disabled — a chained PTY (ssh inside ssh, rift inside tmux, etc.)
+        // can capture a partially-disabled mode at attach time.
+        use nix::sys::termios::{InputFlags, LocalFlags};
+        let mut restored = self.saved.clone();
+        restored.local_flags |= LocalFlags::ECHO
+            | LocalFlags::ECHOE
+            | LocalFlags::ECHOK
+            | LocalFlags::ICANON
+            | LocalFlags::ISIG
+            | LocalFlags::IEXTEN;
+        restored.input_flags |= InputFlags::ICRNL | InputFlags::BRKINT;
+        let _ = termios::tcsetattr(&bfd, SetArg::TCSANOW, &restored);
     }
 }
 
@@ -922,7 +937,41 @@ pub fn run_client(socket: OwnedFd) -> i32 {
         let _ = ipc::send(socket_fd, Tag::SshAuthSock, ssh_auth_sock.as_bytes());
     }
 
-    client_loop(socket_fd, sig_read, stdin_fd, stdout_fd)
+    let code = client_loop(socket_fd, sig_read, stdin_fd, stdout_fd);
+    // Programs in the session (starship, vim, mouse-aware tools) may have
+    // enabled DEC private modes that the detach path never gets to disable.
+    // Send the standard "be sane" set before we restore termios so the
+    // user's shell isn't stuck reporting mouse coords / hidden cursor.
+    write_terminal_reset(stdout_fd);
+    code
+}
+
+fn write_terminal_reset(fd: RawFd) {
+    // Restore a sane terminal on detach: disable all common mouse-tracking
+    // variants, focus reporting, bracketed paste; exit alternate screen
+    // (both 1049 and the older 47); reset SGR; show the cursor; exit
+    // alternate keypad. DECSTR (`\e[!p`), cursor-home and scrolling-region
+    // reset were tried but triggered terminal status responses that got
+    // echoed back to the user's shell — keep this set minimal.
+    const RESET: &[u8] = b"\
+\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\
+\x1b[?2004l\
+\x1b[?1049l\x1b[?47l\
+\x1b[0m\
+\x1b[?25h\
+\x1b>";
+    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let mut written = 0;
+    while written < RESET.len() {
+        match unistd::write(&bfd, &RESET[written..]) {
+            Ok(n) if n > 0 => written += n,
+            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => continue,
+            _ => break,
+        }
+    }
+    // Drain so the reset bytes reach the terminal before we restore termios
+    // or exit; otherwise the kernel may discard them.
+    let _ = termios::tcdrain(&bfd);
 }
 
 fn drain_output(fd: RawFd, buf: &mut Vec<u8>) {
