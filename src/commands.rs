@@ -375,9 +375,6 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
                         Tag::Output => {
                             let _ = ipc::write_all(stdout_fd, payload);
                         }
-                        Tag::Ack => {
-                            return if payload.is_empty() { 0 } else { payload[0] as i32 };
-                        }
                         _ => {}
                     }
                 }

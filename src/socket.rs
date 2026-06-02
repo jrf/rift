@@ -144,6 +144,13 @@ fn set_nonblock(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Set both O_NONBLOCK and FD_CLOEXEC on a file descriptor.
+pub fn set_nonblock_and_cloexec(fd: RawFd) -> io::Result<()> {
+    set_nonblock(fd)?;
+    set_cloexec(fd)?;
+    Ok(())
+}
+
 /// Create a non-blocking Unix domain socket, bind, and listen.
 pub fn create_socket(path: &Path) -> io::Result<OwnedFd> {
     let owned_fd = nix_socket::socket(

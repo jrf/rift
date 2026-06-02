@@ -9,7 +9,6 @@ use crate::socket;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-#[allow(dead_code)]
 pub enum Tag {
     Input = 0,
     Output = 1,
@@ -21,17 +20,27 @@ pub enum Tag {
     Init = 7,
     History = 8,
     Run = 9,
-    Ack = 10,
-    Switch = 11,
-    Write = 12,
-    TaskComplete = 13,
     Print = 14,
     SshAuthSock = 15,
 }
 
 impl Tag {
     pub fn from_u8(v: u8) -> Option<Tag> {
-        (v <= Tag::SshAuthSock as u8).then(|| unsafe { std::mem::transmute::<u8, Tag>(v) })
+        match v {
+            0 => Some(Tag::Input),
+            1 => Some(Tag::Output),
+            2 => Some(Tag::Resize),
+            3 => Some(Tag::Detach),
+            4 => Some(Tag::DetachAll),
+            5 => Some(Tag::Kill),
+            6 => Some(Tag::Info),
+            7 => Some(Tag::Init),
+            8 => Some(Tag::History),
+            9 => Some(Tag::Run),
+            14 => Some(Tag::Print),
+            15 => Some(Tag::SshAuthSock),
+            _ => None,
+        }
     }
 }
 

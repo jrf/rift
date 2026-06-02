@@ -63,22 +63,6 @@ fn redirect_std_to_devnull() {
     }
 }
 
-pub fn set_nonblock_and_cloexec(fd: RawFd) -> io::Result<()> {
-    use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
-    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
-
-    let fl = fcntl(&bfd, FcntlArg::F_GETFL).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-    let fl = OFlag::from_bits_truncate(fl) | OFlag::O_NONBLOCK;
-    fcntl(&bfd, FcntlArg::F_SETFL(fl)).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-
-    let fd_flags =
-        fcntl(&bfd, FcntlArg::F_GETFD).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-    let fd_flags = FdFlag::from_bits_truncate(fd_flags) | FdFlag::FD_CLOEXEC;
-    fcntl(&bfd, FcntlArg::F_SETFD(fd_flags)).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Self-pipe signal trick
 // ---------------------------------------------------------------------------
@@ -95,18 +79,18 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     }
 }
 
-pub fn create_signal_pipe() -> io::Result<(RawFd, RawFd)> {
+fn create_signal_pipe() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    set_nonblock_and_cloexec(fds[0])?;
-    set_nonblock_and_cloexec(fds[1])?;
+    socket::set_nonblock_and_cloexec(fds[0])?;
+    socket::set_nonblock_and_cloexec(fds[1])?;
     SIGNAL_FD.store(fds[1], Ordering::Relaxed);
     Ok((fds[0], fds[1]))
 }
 
-pub fn install_signal_handler(sig: Signal) {
+fn install_signal_handler(sig: Signal) {
     let sa = SigAction::new(
         SigHandler::Handler(signal_handler),
         SaFlags::SA_RESTART,
@@ -128,7 +112,7 @@ pub fn ignore_signal(sig: Signal) {
 // Terminal raw mode
 // ---------------------------------------------------------------------------
 
-pub fn enter_raw_mode(fd: RawFd) -> io::Result<Termios> {
+fn enter_raw_mode(fd: RawFd) -> io::Result<Termios> {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
     let saved = termios::tcgetattr(&bfd).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     let mut raw = saved.clone();
@@ -139,9 +123,9 @@ pub fn enter_raw_mode(fd: RawFd) -> io::Result<Termios> {
     Ok(saved)
 }
 
-pub struct RawModeGuard {
-    pub fd: RawFd,
-    pub saved: Termios,
+struct RawModeGuard {
+    fd: RawFd,
+    saved: Termios,
 }
 
 impl Drop for RawModeGuard {
@@ -215,7 +199,7 @@ fn drain_da_queries(master_fd: RawFd) -> Vec<u8> {
 // PTY spawning
 // ---------------------------------------------------------------------------
 
-pub fn spawn_pty(
+fn spawn_pty(
     cmd: &str,
     args: &[&str],
     rows: u16,
@@ -282,7 +266,7 @@ pub fn spawn_pty(
         }
     }
 
-    set_nonblock_and_cloexec(master_fd)?;
+    socket::set_nonblock_and_cloexec(master_fd)?;
     Ok((master_fd, pid))
 }
 
@@ -406,7 +390,7 @@ impl Daemon {
         let _ = self.clients[i].queue_send(Tag::Info, &payload);
     }
 
-    fn handle_signal(&mut self) -> bool {
+    fn handle_signal(&mut self) {
         let mut buf = [0u8; 64];
         let _ = read_raw(self.signal_read_fd, &mut buf);
 
@@ -426,7 +410,6 @@ impl Daemon {
                 self.task_exit_code
             );
         }
-        false
     }
 
     fn handle_server(&mut self) {
@@ -437,7 +420,7 @@ impl Daemon {
                 break;
             }
             let client_fd = unsafe { OwnedFd::from_raw_fd(r) };
-            if let Err(e) = set_nonblock_and_cloexec(client_fd.as_raw_fd()) {
+            if let Err(e) = socket::set_nonblock_and_cloexec(client_fd.as_raw_fd()) {
                 log::warn!("failed to set flags on client fd: {}", e);
                 continue;
             }
@@ -571,10 +554,7 @@ impl Daemon {
                         for j in 0..self.clients.len() {
                             let _ = self.clients[j].queue_send(Tag::Detach, &[]);
                         }
-                        remove.clear();
-                        for j in 0..self.clients.len() {
-                            remove.push(j);
-                        }
+                        remove.extend(0..self.clients.len());
                         break;
                     }
                     Tag::Kill => {
@@ -722,7 +702,7 @@ fn daemon_loop(daemon: &mut Daemon) {
     }
 }
 
-pub fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
+fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     ignore_signal(Signal::SIGPIPE);
 
     if let Ok(ssh_auth_sock) = std::env::var("SSH_AUTH_SOCK") {
@@ -897,12 +877,12 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     let stdin_fd: RawFd = 0;
     let stdout_fd: RawFd = 1;
 
-    if let Err(e) = set_nonblock_and_cloexec(socket_fd) {
+    if let Err(e) = socket::set_nonblock_and_cloexec(socket_fd) {
         eprintln!("error: failed to set socket nonblock: {}", e);
         return 1;
     }
 
-    if let Err(e) = set_nonblock_and_cloexec(stdout_fd) {
+    if let Err(e) = socket::set_nonblock_and_cloexec(stdout_fd) {
         eprintln!("error: failed to set stdout nonblock: {}", e);
         return 1;
     }
@@ -944,13 +924,13 @@ pub fn run_client(socket: OwnedFd) -> i32 {
         let _ = ipc::send(socket_fd, Tag::SshAuthSock, ssh_auth_sock.as_bytes());
     }
 
-    let code = client_loop(socket_fd, sig_read, stdin_fd, stdout_fd);
+    client_loop(socket_fd, sig_read, stdin_fd, stdout_fd);
     // Programs in the session (starship, vim, mouse-aware tools) may have
     // enabled DEC private modes that the detach path never gets to disable.
     // Send the standard "be sane" set before we restore termios so the
     // user's shell isn't stuck reporting mouse coords / hidden cursor.
     write_terminal_reset(stdout_fd);
-    code
+    0
 }
 
 fn write_terminal_reset(fd: RawFd) {
@@ -995,12 +975,10 @@ fn drain_output(fd: RawFd, buf: &mut Vec<u8>) {
     }
 }
 
-fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: RawFd) -> i32 {
+fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: RawFd) {
     let mut socket_buf = SocketBuffer::new();
     let mut out_buf: Vec<u8> = Vec::new();
-    let mut exit_code: i32 = 0;
     let mut detached = false;
-    const MAX_OUT_BUF: usize = 4 * 1024 * 1024;
 
     loop {
         let stdin_bfd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
@@ -1080,13 +1058,6 @@ fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: R
                                     detached = true;
                                     break;
                                 }
-                                Tag::Ack => {
-                                    if !payload.is_empty() {
-                                        exit_code = payload[0] as i32;
-                                    }
-                                    drain_output(stdout_fd, &mut out_buf);
-                                    return exit_code;
-                                }
                                 _ => {}
                             }
                         }
@@ -1104,7 +1075,6 @@ fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: R
     }
 
     drain_output(stdout_fd, &mut out_buf);
-    exit_code
 }
 
 fn now_epoch() -> u64 {
