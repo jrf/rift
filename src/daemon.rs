@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -11,13 +10,13 @@ use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal
 use nix::sys::termios::{self, SetArg, Termios};
 use nix::unistd;
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration, Instant};
+use tokio_util::codec::{FramedRead, FramedWrite};
 
-use crate::ipc::{self, SocketBuffer, Tag};
+use crate::ipc::{self, RiftCodec, Tag};
 use crate::socket;
 use crate::util;
 
@@ -68,44 +67,6 @@ fn redirect_std_to_devnull() {
                 libc::close(devnull);
             }
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Self-pipe signal trick
-// ---------------------------------------------------------------------------
-
-static SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
-
-extern "C" fn signal_handler(_sig: libc::c_int) {
-    let fd = SIGNAL_FD.load(Ordering::Relaxed);
-    if fd >= 0 {
-        unsafe {
-            let byte: u8 = 1;
-            libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
-        }
-    }
-}
-
-fn create_signal_pipe() -> io::Result<(RawFd, RawFd)> {
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    socket::set_nonblock_and_cloexec(fds[0])?;
-    socket::set_nonblock_and_cloexec(fds[1])?;
-    SIGNAL_FD.store(fds[1], Ordering::Relaxed);
-    Ok((fds[0], fds[1]))
-}
-
-fn install_signal_handler(sig: Signal) {
-    let sa = SigAction::new(
-        SigHandler::Handler(signal_handler),
-        SaFlags::SA_RESTART,
-        SigSet::empty(),
-    );
-    unsafe {
-        let _ = sigaction(sig, &sa);
     }
 }
 
@@ -499,7 +460,9 @@ impl DaemonState {
 }
 
 /// Per-client task: owns the UnixStream, reads frames into the daemon via
-/// `daemon_tx`, writes outbound frames received on its own channel.
+/// `daemon_tx`, writes outbound frames received on its own channel. Uses
+/// `RiftCodec` via FramedRead/FramedWrite so wire encoding/decoding lives
+/// entirely in `ipc::RiftCodec`.
 async fn client_task(
     stream: UnixStream,
     id: u64,
@@ -507,64 +470,48 @@ async fn client_task(
     mut rx: mpsc::Receiver<DaemonFrame>,
     daemon_tx: mpsc::UnboundedSender<(u64, ClientMsg)>,
 ) {
-    let (read_half, mut write_half) = stream.into_split();
+    use futures_util::{SinkExt, StreamExt};
 
-    // Write task: serialize DaemonFrames into the wire protocol.
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = FramedRead::new(read_half, RiftCodec);
+    let mut writer = FramedWrite::new(write_half, RiftCodec);
+
+    // Write task: drain mpsc into the framed writer.
     let write_join = tokio::task::spawn_local(async move {
         if let Some(initial) = initial {
-            let header = ipc::encode_header(initial.tag, initial.payload.len() as u32);
-            if write_half.write_all(&header).await.is_err() {
-                return;
-            }
-            if write_half.write_all(&initial.payload).await.is_err() {
+            if writer.send((initial.tag, initial.payload)).await.is_err() {
                 return;
             }
         }
         while let Some(frame) = rx.recv().await {
-            let header = ipc::encode_header(frame.tag, frame.payload.len() as u32);
-            if write_half.write_all(&header).await.is_err() {
-                break;
-            }
-            if write_half.write_all(&frame.payload).await.is_err() {
+            if writer.send((frame.tag, frame.payload)).await.is_err() {
                 break;
             }
         }
     });
 
-    let _ = client_read_loop(read_half, id, daemon_tx.clone()).await;
+    // Read loop: decoded frames straight from the codec, forwarded to daemon.
+    while let Some(item) = reader.next().await {
+        let (tag, payload) = match item {
+            Ok(f) => f,
+            Err(_) => break,
+        };
+        if daemon_tx
+            .send((
+                id,
+                ClientMsg::Frame {
+                    tag,
+                    payload: payload.to_vec(),
+                },
+            ))
+            .is_err()
+        {
+            break;
+        }
+    }
 
     let _ = daemon_tx.send((id, ClientMsg::Gone));
     write_join.abort();
-}
-
-async fn client_read_loop(
-    mut read_half: tokio::net::unix::OwnedReadHalf,
-    id: u64,
-    daemon_tx: mpsc::UnboundedSender<(u64, ClientMsg)>,
-) -> io::Result<()> {
-    let mut buf = SocketBuffer::new();
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = read_half.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        buf.feed(&tmp[..n]);
-        while let Some((tag, payload)) = buf.next() {
-            if daemon_tx
-                .send((
-                    id,
-                    ClientMsg::Frame {
-                        tag,
-                        payload: payload.to_vec(),
-                    },
-                ))
-                .is_err()
-            {
-                return Ok(());
-            }
-        }
-    }
 }
 
 async fn daemon_main(
@@ -938,6 +885,16 @@ pub fn spawn_daemon_detached(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
 // Client
 // ---------------------------------------------------------------------------
 
+/// No-close wrapper so `AsyncFd<StdioFd>` can register stdin/stdout with the
+/// reactor without taking ownership of the fd. Dropping the wrapper does
+/// NOT close the underlying fd — the OS still owns process stdio.
+struct StdioFd(RawFd);
+impl AsRawFd for StdioFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
 pub fn run_client(socket: OwnedFd) -> i32 {
     let socket_fd = socket.as_raw_fd();
     let stdin_fd: RawFd = 0;
@@ -947,12 +904,16 @@ pub fn run_client(socket: OwnedFd) -> i32 {
         eprintln!("error: failed to set socket nonblock: {}", e);
         return 1;
     }
-
     if let Err(e) = socket::set_nonblock_and_cloexec(stdout_fd) {
         eprintln!("error: failed to set stdout nonblock: {}", e);
         return 1;
     }
+    if let Err(e) = socket::set_nonblock_and_cloexec(stdin_fd) {
+        eprintln!("error: failed to set stdin nonblock: {}", e);
+        return 1;
+    }
     let _stdout_guard = NonBlockGuard { fd: stdout_fd };
+    let _stdin_guard = NonBlockGuard { fd: stdin_fd };
 
     let saved = match enter_raw_mode(stdin_fd) {
         Ok(s) => s,
@@ -961,7 +922,7 @@ pub fn run_client(socket: OwnedFd) -> i32 {
             return 1;
         }
     };
-    let _guard = RawModeGuard {
+    let _raw_guard = RawModeGuard {
         fd: stdin_fd,
         saved,
     };
@@ -974,29 +935,182 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     write_terminal_reset(stdout_fd);
 
     ignore_signal(Signal::SIGPIPE);
-    let (sig_read, _sig_write) = match create_signal_pipe() {
-        Ok(fds) => fds,
+
+    // Convert the connected socket into a tokio UnixStream. OwnedFd is
+    // consumed; the underlying fd lives on inside UnixStream until it drops.
+    let std_socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(socket.into_raw_fd()) };
+    if let Err(e) = std_socket.set_nonblocking(true) {
+        eprintln!("error: failed to set socket nonblock: {}", e);
+        return 1;
+    }
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
         Err(e) => {
-            eprintln!("error: failed to create signal pipe: {}", e);
+            eprintln!("error: failed to build runtime: {}", e);
             return 1;
         }
     };
-    install_signal_handler(Signal::SIGWINCH);
 
-    let size = ipc::get_terminal_size(stdout_fd);
-    let _ = ipc::send(socket_fd, Tag::Resize, &size.encode());
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
+        let stream = match UnixStream::from_std(std_socket) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: failed to wrap socket: {}", e);
+                return;
+            }
+        };
+        client_async_main(stream, stdin_fd, stdout_fd).await;
+    });
 
-    if let Ok(ssh_auth_sock) = std::env::var("SSH_AUTH_SOCK") {
-        let _ = ipc::send(socket_fd, Tag::SshAuthSock, ssh_auth_sock.as_bytes());
-    }
-
-    client_loop(socket_fd, sig_read, stdin_fd, stdout_fd);
     // Programs in the session (starship, vim, mouse-aware tools) may have
     // enabled DEC private modes that the detach path never gets to disable.
     // Send the standard "be sane" set before we restore termios so the
     // user's shell isn't stuck reporting mouse coords / hidden cursor.
     write_terminal_reset(stdout_fd);
     0
+}
+
+async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd) {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = FramedRead::new(read_half, RiftCodec);
+    let mut writer = FramedWrite::new(write_half, RiftCodec);
+
+    let stdin_async = match AsyncFd::new(StdioFd(stdin_fd)) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: failed to wrap stdin: {}", e);
+            return;
+        }
+    };
+    let stdout_async = match AsyncFd::new(StdioFd(stdout_fd)) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: failed to wrap stdout: {}", e);
+            return;
+        }
+    };
+
+    let mut sigwinch = match signal(SignalKind::window_change()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: failed to register SIGWINCH: {}", e);
+            return;
+        }
+    };
+
+    // Send initial size + ssh-auth-sock just like the sync client did.
+    let size = ipc::get_terminal_size(stdout_fd);
+    let _ = writer
+        .send((Tag::Resize, Bytes::copy_from_slice(&size.encode())))
+        .await;
+    if let Ok(ssh_auth_sock) = std::env::var("SSH_AUTH_SOCK") {
+        let _ = writer
+            .send((Tag::SshAuthSock, Bytes::copy_from_slice(ssh_auth_sock.as_bytes())))
+            .await;
+    }
+
+    let mut out_buf: Vec<u8> = Vec::new();
+    let mut stdin_buf = [0u8; 4096];
+
+    loop {
+        let has_pending = !out_buf.is_empty();
+
+        tokio::select! {
+            biased;
+
+            _ = sigwinch.recv() => {
+                let size = ipc::get_terminal_size(stdout_fd);
+                let _ = writer
+                    .send((Tag::Resize, Bytes::copy_from_slice(&size.encode())))
+                    .await;
+            }
+
+            ready = stdin_async.readable() => {
+                let mut guard = match ready {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+                let res = guard.try_io(|inner| {
+                    let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
+                    unistd::read(&bfd, &mut stdin_buf)
+                        .map_err(|e| io::Error::from_raw_os_error(e as i32))
+                });
+                match res {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        let data = &stdin_buf[..n];
+                        if data.contains(&0x1c) || util::is_kitty_ctrl_backslash(data) {
+                            let _ = writer.send((Tag::Detach, Bytes::new())).await;
+                            break;
+                        }
+                        let _ = writer
+                            .send((Tag::Input, Bytes::copy_from_slice(data)))
+                            .await;
+                    }
+                    Ok(Err(_)) => break,
+                    Err(_would_block) => {}
+                }
+            }
+
+            item = reader.next() => {
+                let (tag, payload) = match item {
+                    Some(Ok(f)) => f,
+                    Some(Err(_)) | None => break,
+                };
+                match tag {
+                    Tag::Output | Tag::Init => {
+                        if out_buf.len() + payload.len() > MAX_OUT_BUF {
+                            let excess = out_buf.len() + payload.len() - MAX_OUT_BUF;
+                            out_buf.drain(..excess.min(out_buf.len()));
+                        }
+                        out_buf.extend_from_slice(&payload);
+                    }
+                    Tag::Detach => break,
+                    _ => {}
+                }
+            }
+
+            ready = stdout_async.writable(), if has_pending => {
+                let mut guard = match ready {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+                let res = guard.try_io(|inner| {
+                    let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
+                    unistd::write(&bfd, &out_buf)
+                        .map_err(|e| io::Error::from_raw_os_error(e as i32))
+                });
+                match res {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        out_buf.drain(..n);
+                    }
+                    Ok(Err(_)) => break,
+                    Err(_would_block) => {}
+                }
+            }
+        }
+    }
+
+    // Final synchronous drain so any tail bytes reach the terminal before
+    // the runtime tears down (and write_terminal_reset writes over them).
+    let bfd = unsafe { BorrowedFd::borrow_raw(stdout_fd) };
+    while !out_buf.is_empty() {
+        match unistd::write(&bfd, &out_buf) {
+            Ok(n) if n > 0 => {
+                out_buf.drain(..n);
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            _ => break,
+        }
+    }
 }
 
 fn write_terminal_reset(fd: RawFd) {
@@ -1026,121 +1140,6 @@ fn write_terminal_reset(fd: RawFd) {
     // Drain so the reset bytes reach the terminal before we restore termios
     // or exit; otherwise the kernel may discard them.
     let _ = termios::tcdrain(&bfd);
-}
-
-fn drain_output(fd: RawFd, buf: &mut Vec<u8>) {
-    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
-    while !buf.is_empty() {
-        match unistd::write(&bfd, buf) {
-            Ok(n) if n > 0 => {
-                buf.drain(..n);
-            }
-            Err(nix::errno::Errno::EINTR) => continue,
-            _ => break,
-        }
-    }
-}
-
-fn client_loop(socket_fd: RawFd, signal_fd: RawFd, stdin_fd: RawFd, stdout_fd: RawFd) {
-    let mut socket_buf = SocketBuffer::new();
-    let mut out_buf: Vec<u8> = Vec::new();
-    let mut detached = false;
-
-    loop {
-        let stdin_bfd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
-        let sock_bfd = unsafe { BorrowedFd::borrow_raw(socket_fd) };
-        let sig_bfd = unsafe { BorrowedFd::borrow_raw(signal_fd) };
-
-        let has_pending_output = !out_buf.is_empty();
-        let mut poll_fds = vec![
-            PollFd::new(stdin_bfd, PollFlags::POLLIN),
-            PollFd::new(sock_bfd, PollFlags::POLLIN),
-            PollFd::new(sig_bfd, PollFlags::POLLIN),
-        ];
-        if has_pending_output {
-            let out_bfd = unsafe { BorrowedFd::borrow_raw(stdout_fd) };
-            poll_fds.push(PollFd::new(out_bfd, PollFlags::POLLOUT));
-        }
-
-        match poll(&mut poll_fds, PollTimeout::NONE) {
-            Ok(_) => {}
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => break,
-        }
-
-        if has_pending_output {
-            if let Some(revents) = poll_fds[3].revents() {
-                if revents.contains(PollFlags::POLLOUT) {
-                    drain_output(stdout_fd, &mut out_buf);
-                }
-            }
-        }
-
-        if let Some(revents) = poll_fds[2].revents() {
-            if revents.contains(PollFlags::POLLIN) {
-                let mut buf = [0u8; 64];
-                let _ = read_raw(signal_fd, &mut buf);
-                let size = ipc::get_terminal_size(stdout_fd);
-                let _ = ipc::send(socket_fd, Tag::Resize, &size.encode());
-            }
-        }
-
-        if let Some(revents) = poll_fds[0].revents() {
-            if revents.contains(PollFlags::POLLIN) {
-                let mut buf = [0u8; 4096];
-                match read_raw(stdin_fd, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = &buf[..n];
-                        if data.contains(&0x1c) || util::is_kitty_ctrl_backslash(data) {
-                            let _ = ipc::send(socket_fd, Tag::Detach, &[]);
-                            break;
-                        }
-                        let _ = ipc::send(socket_fd, Tag::Input, data);
-                    }
-                    Err(nix::errno::Errno::EAGAIN) => {}
-                    Err(_) => break,
-                }
-            }
-        }
-
-        if let Some(revents) = poll_fds[1].revents() {
-            if revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP) {
-                match socket_buf.read(socket_fd) {
-                    Ok(0) => {
-                        break;
-                    }
-                    Ok(_) => {
-                        while let Some((tag, payload)) = socket_buf.next() {
-                            match tag {
-                                Tag::Output | Tag::Init => {
-                                    if out_buf.len() + payload.len() > MAX_OUT_BUF {
-                                        let excess = out_buf.len() + payload.len() - MAX_OUT_BUF;
-                                        out_buf.drain(..excess.min(out_buf.len()));
-                                    }
-                                    out_buf.extend_from_slice(&payload);
-                                }
-                                Tag::Detach => {
-                                    detached = true;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        drain_output(stdout_fd, &mut out_buf);
-                    }
-                    Err(nix::errno::Errno::EAGAIN) => {}
-                    Err(_) => break,
-                }
-            }
-        }
-
-        if detached {
-            break;
-        }
-    }
-
-    drain_output(stdout_fd, &mut out_buf);
 }
 
 fn now_epoch() -> u64 {

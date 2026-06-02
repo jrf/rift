@@ -10,5 +10,7 @@ libc = "0.2.183"
 log = "0.4.29"
 nix = { version = "0.31.2", features = ["poll", "signal", "term", "fs", "net", "process"] }
 bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "signal", "io-util", "macros", "time", "sync"] }
+tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
 vt100 = "0.16.2"

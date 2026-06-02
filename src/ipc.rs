@@ -2,8 +2,10 @@ use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd;
+use tokio_util::codec::{Decoder, Encoder};
 
 use crate::socket;
 
@@ -220,22 +222,6 @@ impl SocketBuffer {
         Ok(n)
     }
 
-    /// Append pre-read bytes into the buffer. Use when bytes are sourced
-    /// externally (e.g. an async `AsyncRead`) rather than via raw fd read.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.head > 0 {
-            let remaining = self.buf.len() - self.head;
-            if remaining > 0 {
-                self.buf.copy_within(self.head.., 0);
-                self.buf.truncate(remaining);
-            } else {
-                self.buf.clear();
-            }
-            self.head = 0;
-        }
-        self.buf.extend_from_slice(bytes);
-    }
-
     /// Returns the next complete message or None.
     /// The returned slice borrows from the buffer; convert with `.to_vec()`
     /// if you need to release the borrow before the next iteration.
@@ -324,5 +310,48 @@ pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RiftCodec — tokio_util Encoder/Decoder for the wire protocol
+// ---------------------------------------------------------------------------
+
+/// Async codec for the rift wire protocol, used with `tokio_util::codec::Framed`.
+/// Wire format per frame: `[1 byte tag][4 bytes len LE][payload]`. Unknown
+/// tag bytes are silently skipped (matching `SocketBuffer::next` behavior).
+pub struct RiftCodec;
+
+impl Decoder for RiftCodec {
+    type Item = (Tag, Bytes);
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < HEADER_SIZE {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes([src[1], src[2], src[3], src[4]]) as usize;
+        let total = HEADER_SIZE + len;
+        if src.len() < total {
+            src.reserve(total - src.len());
+            return Ok(None);
+        }
+        let tag_byte = src[0];
+        src.advance(HEADER_SIZE);
+        let payload = src.split_to(len).freeze();
+        Ok(Tag::from_u8(tag_byte).map(|t| (t, payload)))
+    }
+}
+
+impl Encoder<(Tag, Bytes)> for RiftCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: (Tag, Bytes), dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let (tag, payload) = item;
+        dst.reserve(HEADER_SIZE + payload.len());
+        dst.put_u8(tag as u8);
+        dst.put_u32_le(payload.len() as u32);
+        dst.extend_from_slice(&payload);
+        Ok(())
     }
 }
