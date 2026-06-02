@@ -24,6 +24,7 @@ pub enum Tag {
     Run = 9,
     Print = 14,
     SshAuthSock = 15,
+    Rename = 16,
 }
 
 impl Tag {
@@ -41,6 +42,7 @@ impl Tag {
             9 => Some(Tag::Run),
             14 => Some(Tag::Print),
             15 => Some(Tag::SshAuthSock),
+            16 => Some(Tag::Rename),
             _ => None,
         }
     }

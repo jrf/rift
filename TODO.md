@@ -9,6 +9,7 @@
 ## Scrapped
 
 ## Done
+- [x] Rename sessions — `rift rename [<old_name>] <new_name>` (alias `rn`) dynamically renames active sessions, including Unix sockets, logs, and symlinks #feature
 - [x] Migrate daemon and client to async tokio runtime (current_thread + LocalSet, per-client tasks via mpsc, `tokio-util` codec for the wire protocol) #refactor
 - [x] Use deterministic socket dir (`$HOME/.local/state/rift`) so macOS GUI- vs CLI-launched shells share the same sessions #bug
 - [x] Fix rift tail escape sequence rendering and Ctrl+C interrupt bug #bug

@@ -204,6 +204,8 @@ struct DaemonState {
     clients: HashMap<u64, mpsc::Sender<DaemonFrame>>,
     last_client_disconnected_at: Option<u64>,
     empty_timeout: Option<u64>,
+    old_session_names: Vec<String>,
+    log_system: &'static crate::logger::LogSystem,
 }
 
 impl DaemonState {
@@ -371,6 +373,99 @@ impl DaemonState {
                             &self.session_name,
                             path,
                         );
+                    }
+                }
+            }
+            Tag::Rename => {
+                if !payload.is_empty() {
+                    if let Ok(new_name_str) = std::str::from_utf8(&payload) {
+                        let new_name = new_name_str.to_string();
+                        if new_name != self.session_name {
+                            let old_socket_path = self.socket_dir.join(&self.session_name);
+                            let new_socket_path = self.socket_dir.join(&new_name);
+
+                            if new_socket_path.exists() {
+                                log::error!(
+                                    "rename failed: target socket path already exists: {}",
+                                    new_socket_path.display()
+                                );
+                            } else {
+                                match std::fs::rename(&old_socket_path, &new_socket_path) {
+                                    Ok(()) => {
+                                        log::info!(
+                                            "session renamed: '{}' -> '{}'",
+                                            self.session_name,
+                                            new_name
+                                        );
+
+                                        // Update SSH auth sock symlink
+                                        let old_symlink = self.socket_dir.join(format!(
+                                            "{}.ssh-auth-sock",
+                                            self.session_name
+                                        ));
+                                        let new_symlink = self.socket_dir.join(format!(
+                                            "{}.ssh-auth-sock",
+                                            new_name
+                                        ));
+                                        if let Ok(target) = std::fs::read_link(&old_symlink) {
+                                            if new_symlink.exists() || new_symlink.is_symlink() {
+                                                let _ = std::fs::remove_file(&new_symlink);
+                                            }
+                                            let _ = std::os::unix::fs::symlink(&target, &new_symlink);
+
+                                            // Recreate old symlink to point to new symlink
+                                            let _ = std::fs::remove_file(&old_symlink);
+                                            let _ = std::os::unix::fs::symlink(&new_symlink, &old_symlink);
+                                        }
+
+                                        // Update logging path
+                                        let old_log_path = self
+                                            .socket_dir
+                                            .join("logs")
+                                            .join(format!("{}.log", self.session_name));
+                                        let new_log_path = self
+                                            .socket_dir
+                                            .join("logs")
+                                            .join(format!("{}.log", new_name));
+                                        let old_log_old_path = self
+                                            .socket_dir
+                                            .join("logs")
+                                            .join(format!("{}.log.old", self.session_name));
+                                        let new_log_old_path = self
+                                            .socket_dir
+                                            .join("logs")
+                                            .join(format!("{}.log.old", new_name));
+
+                                        if old_log_path.exists() {
+                                            let _ = std::fs::rename(&old_log_path, &new_log_path);
+                                        }
+                                        if old_log_old_path.exists() {
+                                            let _ = std::fs::rename(&old_log_old_path, &new_log_old_path);
+                                        }
+
+                                        if let Err(e) = self.log_system.init(&new_log_path) {
+                                            log::error!(
+                                                "failed to re-init log at {}: {}",
+                                                new_log_path.display(),
+                                                e
+                                            );
+                                        }
+
+                                        // Store the old session name for cleanup on exit
+                                        self.old_session_names.push(self.session_name.clone());
+
+                                        // Update active session name
+                                        self.session_name = new_name;
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "rename failed: failed to rename socket: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -621,6 +716,18 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
     for (_id, tx) in state.clients.drain() {
         let _ = tx.try_send(detach.clone());
     }
+
+    // Clean up current active socket and symlink
+    let active_socket = state.socket_dir.join(&state.session_name);
+    let _ = std::fs::remove_file(active_socket);
+    let active_symlink = state.socket_dir.join(format!("{}.ssh-auth-sock", state.session_name));
+    let _ = std::fs::remove_file(active_symlink);
+
+    // Clean up any historical/old symlinks left behind by rename
+    for old_name in &state.old_session_names {
+        let old_symlink = state.socket_dir.join(format!("{}.ssh-auth-sock", old_name));
+        let _ = std::fs::remove_file(old_symlink);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -701,6 +808,8 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
         clients: HashMap::new(),
         last_client_disconnected_at: None,
         empty_timeout,
+        old_session_names: Vec::new(),
+        log_system,
     };
 
     let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(server_fd) };
@@ -737,12 +846,6 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     });
 
     log::info!("daemon exiting, session={}", session_name);
-
-    let _ = std::fs::remove_file(&cfg.socket_path);
-    let symlink_path = cfg
-        .socket_dir
-        .join(format!("{}.ssh-auth-sock", cfg.session_name));
-    let _ = std::fs::remove_file(symlink_path);
 }
 
 fn fork_daemon(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {

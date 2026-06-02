@@ -2,11 +2,11 @@ use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::Signal;
 
 use crate::daemon::{self, Cfg};
-use crate::ipc::{self, Tag, SocketBuffer};
+use crate::ipc::{self, SocketBuffer, Tag};
 use crate::socket;
 use crate::util;
 
@@ -17,7 +17,11 @@ use crate::util;
 pub fn cmd_list(short: bool) -> i32 {
     let socket_dir = socket::socket_dir();
     let current = socket::session_name_from_env();
-    let current_ref = if current.is_empty() { None } else { Some(current.as_str()) };
+    let current_ref = if current.is_empty() {
+        None
+    } else {
+        Some(current.as_str())
+    };
 
     match util::get_session_entries(&socket_dir) {
         Ok(entries) => {
@@ -46,11 +50,17 @@ pub fn cmd_list(short: bool) -> i32 {
 fn kill_one(socket_dir: &Path, session_name: &str, force: bool) -> i32 {
     let socket_path = match socket::get_socket_path(socket_dir, session_name) {
         Ok(p) => p,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
     let path_str = match socket_path.to_str() {
         Some(s) => s,
-        None => { eprintln!("error: invalid socket path"); return 1; }
+        None => {
+            eprintln!("error: invalid socket path");
+            return 1;
+        }
     };
 
     let pid = match ipc::probe_session(path_str) {
@@ -83,7 +93,9 @@ fn kill_one(socket_dir: &Path, session_name: &str, force: bool) -> i32 {
 
     if force {
         if let Some(pid) = pid {
-            unsafe { libc::kill(pid, libc::SIGKILL); }
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
         socket::cleanup_stale_socket(socket_dir, session_name);
@@ -98,7 +110,9 @@ fn kill_one(socket_dir: &Path, session_name: &str, force: bool) -> i32 {
     }
 
     if let Some(pid) = pid {
-        unsafe { libc::kill(pid, libc::SIGTERM); }
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
         for _ in 0..5 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             if let Ok(false) = socket::session_exists(socket_dir, session_name) {
@@ -116,13 +130,18 @@ pub fn cmd_kill(names: &[String], force: bool) -> i32 {
 
     let session_names = match util::resolve_sessions(&socket_dir, names) {
         Ok(s) => s,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
 
     let mut code = 0;
     for name in &session_names {
         let r = kill_one(&socket_dir, name, force);
-        if r != 0 { code = r; }
+        if r != 0 {
+            code = r;
+        }
     }
     code
 }
@@ -134,7 +153,10 @@ pub fn cmd_kill(names: &[String], force: bool) -> i32 {
 pub fn cmd_detach(name: &str) -> i32 {
     let fd = match util::session_connect_by_name(name) {
         Ok(fd) => fd,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
     if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::DetachAll, &[]) {
         eprintln!("error: failed to send detach: {}", e);
@@ -150,7 +172,10 @@ pub fn cmd_detach(name: &str) -> i32 {
 pub fn cmd_history(name: &str, format: util::HistoryFormat) -> i32 {
     let fd = match util::session_connect_by_name(name) {
         Ok(fd) => fd,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
 
     let format_byte = format as u8;
@@ -227,7 +252,8 @@ pub fn cmd_wait(names: &[String]) -> i32 {
             }
         };
 
-        let matching: Vec<&util::SessionEntry> = entries.iter()
+        let matching: Vec<&util::SessionEntry> = entries
+            .iter()
             .filter(|e| util::pattern_matches(&patterns, &e.name))
             .collect();
 
@@ -292,7 +318,10 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
 
     let cfg = match Cfg::resolve(name) {
         Ok(c) => c,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
 
     if let Err(e) = socket::ensure_dirs(&cfg.socket_dir) {
@@ -302,32 +331,41 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
 
     let path_str = match cfg.socket_path.to_str() {
         Some(s) => s.to_string(),
-        None => { eprintln!("error: invalid socket path"); return 1; }
+        None => {
+            eprintln!("error: invalid socket path");
+            return 1;
+        }
     };
 
     let socket_fd: OwnedFd = match socket::session_exists(&cfg.socket_dir, &cfg.session_name) {
-        Ok(true) => {
-            match socket::session_connect(&path_str) {
-                Ok(fd) => fd,
-                Err(_) => {
-                    socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
-                    match daemon::spawn_daemon(&cfg, &[]) {
-                        Ok(fd) => fd,
-                        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Ok(true) => match socket::session_connect(&path_str) {
+            Ok(fd) => fd,
+            Err(_) => {
+                socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
+                match daemon::spawn_daemon(&cfg, &[]) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        return 1;
                     }
                 }
             }
-        }
-        Ok(false) => {
-            match daemon::spawn_daemon(&cfg, &[]) {
-                Ok(fd) => fd,
-                Err(e) => { eprintln!("error: {}", e); return 1; }
+        },
+        Ok(false) => match daemon::spawn_daemon(&cfg, &[]) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return 1;
             }
+        },
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
         }
-        Err(e) => { eprintln!("error: {}", e); return 1; }
     };
 
-    let cmd_str: String = cmd_args.iter()
+    let cmd_str: String = cmd_args
+        .iter()
         .map(|a| {
             if util::shell_needs_quoting(a) {
                 util::shell_quote(a)
@@ -394,7 +432,10 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
 pub fn cmd_send(name: &str, text_args: &[String]) -> i32 {
     let fd = match util::session_connect_by_name(name) {
         Ok(fd) => fd,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
 
     let data = if text_args.is_empty() {
@@ -422,7 +463,10 @@ pub fn cmd_send(name: &str, text_args: &[String]) -> i32 {
 pub fn cmd_print(name: &str, text_args: &[String]) -> i32 {
     let fd = match util::session_connect_by_name(name) {
         Ok(fd) => fd,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
 
     let data = if text_args.is_empty() {
@@ -454,7 +498,10 @@ pub fn cmd_write(name: &str, path: &str) -> i32 {
 
     let fd = match util::session_connect_by_name(name) {
         Ok(fd) => fd,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
 
     let mut stdin_data = Vec::new();
@@ -477,9 +524,17 @@ pub fn cmd_write(name: &str, path: &str) -> i32 {
     for (i, chunk) in chunks.iter().enumerate() {
         let encoded = engine.encode(chunk);
         let cmd = if i == 0 {
-            format!("printf '{}' | base64 -d > {}\n", encoded, util::shell_quote(path))
+            format!(
+                "printf '{}' | base64 -d > {}\n",
+                encoded,
+                util::shell_quote(path)
+            )
         } else {
-            format!("printf '{}' | base64 -d >> {}\n", encoded, util::shell_quote(path))
+            format!(
+                "printf '{}' | base64 -d >> {}\n",
+                encoded,
+                util::shell_quote(path)
+            )
         };
         if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::Input, cmd.as_bytes()) {
             eprintln!("error: failed to send chunk: {}", e);
@@ -502,7 +557,10 @@ pub fn cmd_tail(names: &[String]) -> i32 {
 
     let session_names = match util::resolve_sessions(&socket_dir, names) {
         Ok(s) => s,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
 
     let mut fds: Vec<OwnedFd> = Vec::new();
@@ -511,18 +569,26 @@ pub fn cmd_tail(names: &[String]) -> i32 {
     for name in &session_names {
         let socket_path = match socket::get_socket_path(&socket_dir, name) {
             Ok(p) => p,
-            Err(e) => { eprintln!("error: {}", e); continue; }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                continue;
+            }
         };
         let path_str = match socket_path.to_str() {
             Some(s) => s,
-            None => { eprintln!("error: invalid socket path"); continue; }
+            None => {
+                eprintln!("error: invalid socket path");
+                continue;
+            }
         };
         match socket::session_connect(path_str) {
             Ok(fd) => {
                 fds.push(fd);
                 bufs.push(SocketBuffer::new());
             }
-            Err(e) => { eprintln!("error: cannot connect to session '{}': {}", name, e); }
+            Err(e) => {
+                eprintln!("error: cannot connect to session '{}': {}", name, e);
+            }
         }
     }
 
@@ -569,7 +635,9 @@ pub fn cmd_tail(names: &[String]) -> i32 {
                 continue;
             }
             match bufs[i].read(fds[i].as_raw_fd()) {
-                Ok(0) => { closed.push(i); }
+                Ok(0) => {
+                    closed.push(i);
+                }
                 Ok(_) => {
                     while let Some((tag, payload)) = bufs[i].next() {
                         if tag == Tag::Output {
@@ -579,7 +647,9 @@ pub fn cmd_tail(names: &[String]) -> i32 {
                     }
                 }
                 Err(nix::errno::Errno::EAGAIN) => {}
-                Err(_) => { closed.push(i); }
+                Err(_) => {
+                    closed.push(i);
+                }
             }
         }
 
@@ -609,7 +679,10 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
 
     let cfg = match Cfg::resolve(name) {
         Ok(c) => c,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
 
     if let Err(e) = socket::ensure_dirs(&cfg.socket_dir) {
@@ -619,7 +692,10 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
 
     let path_str = match cfg.socket_path.to_str() {
         Some(s) => s.to_string(),
-        None => { eprintln!("error: invalid socket path"); return 1; }
+        None => {
+            eprintln!("error: invalid socket path");
+            return 1;
+        }
     };
 
     match socket::session_exists(&cfg.socket_dir, &cfg.session_name) {
@@ -636,7 +712,6 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
                     socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
                 }
             }
-
         }
         Ok(false) => {}
         Err(e) => {
@@ -648,14 +723,67 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
     if detached {
         return match daemon::spawn_daemon_detached(&cfg, cmd) {
             Ok(()) => 0,
-            Err(e) => { eprintln!("error: {}", e); 1 }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                1
+            }
         };
     }
 
     let socket_fd = match daemon::spawn_daemon(&cfg, cmd) {
         Ok(fd) => fd,
-        Err(e) => { eprintln!("error: {}", e); return 1; }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
     };
 
     daemon::run_client(socket_fd)
+}
+
+// ---------------------------------------------------------------------------
+// rename
+// ---------------------------------------------------------------------------
+
+pub fn cmd_rename(name: &str, new_name: &str) -> i32 {
+    if name == new_name {
+        return 0;
+    }
+
+    let prefix = socket::session_prefix();
+    let new_session_name = match socket::get_session_name(&prefix, new_name) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+    let socket_dir = socket::socket_dir();
+    let _ = match socket::get_socket_path(&socket_dir, &new_session_name) {
+        Ok(p) => p,
+        Err(_) => {
+            socket::print_session_name_too_long(&new_session_name, &socket_dir);
+            return 1;
+        }
+    };
+
+    if socket::session_exists(&socket_dir, &new_session_name).unwrap_or(false) {
+        eprintln!("error: session '{}' already exists", new_name);
+        return 1;
+    }
+
+    let fd = match util::session_connect_by_name(name) {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+
+    if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::Rename, new_session_name.as_bytes()) {
+        eprintln!("error: failed to send rename request: {}", e);
+        return 1;
+    }
+
+    0
 }

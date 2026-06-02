@@ -16,7 +16,7 @@ const BASH: &str = r#"_rift_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="attach new run send print write tail detach list completions kill history wait version help"
+  local commands="attach new run send print write tail detach list completions kill history wait version help rename rn"
 
   if [[ $COMP_CWORD -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -24,7 +24,7 @@ const BASH: &str = r#"_rift_completions() {
   fi
 
   case "$prev" in
-    attach|a|new|n|run|r|send|s|print|p|write|wr|tail|t|kill|k|history|hi|detach|d|wait|w)
+    attach|a|new|n|run|r|send|s|print|p|write|wr|tail|t|kill|k|history|hi|detach|d|wait|w|rename|rn)
       local sessions=$(rift list --short 2>/dev/null | tr '\n' ' ')
       COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
       ;;
@@ -64,6 +64,7 @@ const ZSH: &str = r#"_rift() {
         'write:Write stdin to a file in the session'
         'tail:Follow session output in real-time'
         'detach:Detach all clients from a session'
+        'rename:Rename a session'
         'list:List active sessions'
         'completions:Print shell completion script'
         'kill:Kill a session'
@@ -76,7 +77,7 @@ const ZSH: &str = r#"_rift() {
       ;;
     args)
       case $words[2] in
-        attach|a|new|n|kill|k|run|r|send|s|print|p|write|wr|tail|t|detach|d|history|hi|wait|w)
+        attach|a|new|n|kill|k|run|r|send|s|print|p|write|wr|tail|t|detach|d|history|hi|wait|w|rename|rn)
           _rift_sessions
           ;;
         completions)
@@ -116,6 +117,7 @@ complete -c rift -n "__fish_is_nth_token 1" -a 'p print' -d 'Inject text into se
 complete -c rift -n "__fish_is_nth_token 1" -a 'wr write' -d 'Write stdin to a file in the session'
 complete -c rift -n "__fish_is_nth_token 1" -a 't tail' -d 'Follow session output in real-time'
 complete -c rift -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from a session'
+complete -c rift -n "__fish_is_nth_token 1" -a 'rn rename' -d 'Rename a session'
 complete -c rift -n "__fish_is_nth_token 1" -a 'l ls list' -d 'List active sessions'
 complete -c rift -n "__fish_is_nth_token 1" -a 'c completions' -d 'Print shell completion script'
 complete -c rift -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
@@ -126,7 +128,7 @@ complete -c rift -s V -l version -d 'Print version'
 complete -c rift -n "__fish_is_nth_token 1" -a 'h help' -d 'Print help'
 complete -c rift -s h -d 'Print help'
 
-complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w" -a '(rift list --short 2>/dev/null)' -d 'Session name'
+complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w rename rn" -a '(rift list --short 2>/dev/null)' -d 'Session name'
 
 complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish' -d Shell
 

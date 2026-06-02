@@ -23,6 +23,7 @@ enum Command {
     Write { name: String, path: String },
     Detach { name: String },
     History { name: String, format: HistoryFormat },
+    Rename { name: String, new_name: String },
     Wait { names: Vec<String> },
     Completions { shell: String },
     Version,
@@ -146,6 +147,23 @@ fn parse_args() -> Command {
             let names: Vec<String> = args[1..].to_vec();
             Command::Wait { names }
         }
+        "rename" | "rn" => {
+            if args.len() < 2 {
+                eprintln!("error: rename requires a new name");
+                std::process::exit(1);
+            }
+            let (name, new_name) = if args.len() == 2 {
+                let env = socket::session_name_from_env();
+                if env.is_empty() {
+                    eprintln!("error: rename outside a session requires current_name and new_name");
+                    std::process::exit(1);
+                }
+                (env, args[1].clone())
+            } else {
+                (args[1].clone(), args[2].clone())
+            };
+            Command::Rename { name, new_name }
+        }
         "completions" | "c" => {
             if args.len() < 2 {
                 eprintln!("error: completions requires a shell name (bash, zsh, fish)");
@@ -213,6 +231,7 @@ fn main() {
         Command::Tail { names } => commands::cmd_tail(&names),
         Command::History { name, format } => commands::cmd_history(&name, format),
         Command::Wait { names } => commands::cmd_wait(&names),
+        Command::Rename { name, new_name } => commands::cmd_rename(&name, &new_name),
         Command::Completions { shell } => { completions::print_completions(&shell); 0 }
         Command::Attach { name, detached, cmd } => commands::cmd_attach(&name, detached, &cmd),
     };
@@ -237,6 +256,7 @@ Usage:
   rift tail|t <name>...         Follow session output in real-time
   rift history|hi <session>     Print session output (--vt, --html)
   rift detach|d [<session>]     Detach all clients from a session
+  rift rename|rn [<old_name>] <new_name> Rename a session (defaults to $RIFT_SESSION)
   rift kill|k <name>...         Kill sessions (-f to force)
   rift wait|w <name>...         Wait for sessions to complete
   rift completions|c <shell>    Print shell completions (bash, zsh, fish)
