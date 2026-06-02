@@ -1,13 +1,14 @@
+//! Daemon-process side: owns the PTY, accepts client connections, drives
+//! the vt100 parser, and brokers per-client tasks via mpsc channels.
+
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-use nix::sys::termios::{self, SetArg, Termios};
+use nix::sys::signal::Signal;
 use nix::unistd;
 use tokio::io::unix::AsyncFd;
 use tokio::net::{UnixListener, UnixStream};
@@ -20,38 +21,22 @@ use crate::ipc::{self, RiftCodec, Tag};
 use crate::socket;
 use crate::util;
 
-// ---------------------------------------------------------------------------
-// Cfg — session configuration
-// ---------------------------------------------------------------------------
-
-pub struct Cfg {
-    pub session_name: String,
-    pub socket_dir: PathBuf,
-    pub socket_path: PathBuf,
-}
-
-impl Cfg {
-    pub fn resolve(name: &str) -> Result<Self, String> {
-        let prefix = socket::session_prefix();
-        let session_name = socket::get_session_name(&prefix, name).map_err(|e| format!("{}", e))?;
-        let socket_dir = socket::socket_dir();
-        let socket_path = socket::get_socket_path(&socket_dir, &session_name).map_err(|_| {
-            socket::print_session_name_too_long(&session_name, &socket_dir);
-            "socket path too long".to_string()
-        })?;
-        Ok(Cfg {
-            session_name,
-            socket_dir,
-            socket_path,
-        })
-    }
-}
+use super::{ignore_signal, Cfg};
 
 // ---------------------------------------------------------------------------
-// Raw helpers
+// Constants
 // ---------------------------------------------------------------------------
 
-pub fn read_raw(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
+/// Per-client outgoing channel cap. Above this, the slow client is dropped
+/// to prevent unbounded memory growth.
+const CLIENT_TX_BUF: usize = 256;
+const PTY_READ_BUF: usize = 4096;
+
+// ---------------------------------------------------------------------------
+// Low-level helpers (private to the server side)
+// ---------------------------------------------------------------------------
+
+fn read_raw(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
     unistd::read(&bfd, buf)
 }
@@ -70,72 +55,15 @@ fn redirect_std_to_devnull() {
     }
 }
 
-pub fn ignore_signal(sig: Signal) {
-    let sa = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-    unsafe {
-        let _ = sigaction(sig, &sa);
-    }
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ---------------------------------------------------------------------------
-// Terminal raw mode
-// ---------------------------------------------------------------------------
-
-fn enter_raw_mode(fd: RawFd) -> io::Result<Termios> {
-    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let saved = termios::tcgetattr(&bfd).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-    let mut raw = saved.clone();
-    termios::cfmakeraw(&mut raw);
-    raw.control_chars[nix::sys::termios::SpecialCharacterIndices::VQUIT as usize] = 0;
-    termios::tcsetattr(&bfd, SetArg::TCSAFLUSH, &raw)
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-    Ok(saved)
-}
-
-struct RawModeGuard {
-    fd: RawFd,
-    saved: Termios,
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let bfd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        // Restore with TCSANOW, not TCSAFLUSH: TCSAFLUSH discards pending
-        // input, which over an SSH PTY (where bytes are often in flight)
-        // can leave the terminal stuck in raw mode after detach. Also OR in
-        // the must-have line-editing bits in case the saved state had them
-        // disabled — a chained PTY (ssh inside ssh, rift inside tmux, etc.)
-        // can capture a partially-disabled mode at attach time.
-        use nix::sys::termios::{InputFlags, LocalFlags};
-        let mut restored = self.saved.clone();
-        restored.local_flags |= LocalFlags::ECHO
-            | LocalFlags::ECHOE
-            | LocalFlags::ECHOK
-            | LocalFlags::ICANON
-            | LocalFlags::ISIG
-            | LocalFlags::IEXTEN;
-        restored.input_flags |= InputFlags::ICRNL | InputFlags::BRKINT;
-        let _ = termios::tcsetattr(&bfd, SetArg::TCSANOW, &restored);
-    }
-}
-
-struct NonBlockGuard {
-    fd: RawFd,
-}
-
-impl Drop for NonBlockGuard {
-    fn drop(&mut self) {
-        use nix::fcntl::{fcntl, FcntlArg, OFlag};
-        let bfd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        if let Ok(fl) = fcntl(&bfd, FcntlArg::F_GETFL) {
-            let fl = OFlag::from_bits_truncate(fl) & !OFlag::O_NONBLOCK;
-            let _ = fcntl(&bfd, FcntlArg::F_SETFL(fl));
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DA query drain
+// PTY spawn + DA-query drain
 // ---------------------------------------------------------------------------
 
 fn drain_da_queries(master_fd: RawFd) -> Vec<u8> {
@@ -163,10 +91,6 @@ fn drain_da_queries(master_fd: RawFd) -> Vec<u8> {
     }
     collected
 }
-
-// ---------------------------------------------------------------------------
-// PTY spawning
-// ---------------------------------------------------------------------------
 
 fn spawn_pty(
     cmd: &str,
@@ -240,16 +164,8 @@ fn spawn_pty(
 }
 
 // ---------------------------------------------------------------------------
-// Daemon
+// Per-client task plumbing
 // ---------------------------------------------------------------------------
-
-/// Per-client outgoing channel cap. Above this, the slow client is dropped
-/// to prevent unbounded memory growth.
-const CLIENT_TX_BUF: usize = 256;
-const PTY_READ_BUF: usize = 4096;
-/// Client-side output buffer cap (used by `client_loop` when stdout can't
-/// keep up).
-const MAX_OUT_BUF: usize = 4 * 1024 * 1024;
 
 /// Message from a client task back to the daemon main task.
 enum ClientMsg {
@@ -265,6 +181,10 @@ struct DaemonFrame {
     payload: Bytes,
 }
 
+// ---------------------------------------------------------------------------
+// DaemonState — owned exclusively by the main task
+// ---------------------------------------------------------------------------
+
 /// State owned exclusively by the daemon's main task. Because the runtime
 /// is single-threaded (`current_thread`), nothing here needs to be `Send`
 /// or wrapped in a mutex.
@@ -273,7 +193,7 @@ struct DaemonState {
     pty_master_fd: RawFd, // owned by AsyncFd in daemon_main; held here for ioctl/write
     parser: vt100::Parser,
     session_name: String,
-    socket_dir: PathBuf,
+    socket_dir: std::path::PathBuf,
     shell_cmd: String,
     cwd: String,
     created_at: u64,
@@ -459,6 +379,10 @@ impl DaemonState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Async event loop
+// ---------------------------------------------------------------------------
+
 /// Per-client task: owns the UnixStream, reads frames into the daemon via
 /// `daemon_tx`, writes outbound frames received on its own channel. Uses
 /// `RiftCodec` via FramedRead/FramedWrite so wire encoding/decoding lives
@@ -476,7 +400,6 @@ async fn client_task(
     let mut reader = FramedRead::new(read_half, RiftCodec);
     let mut writer = FramedWrite::new(write_half, RiftCodec);
 
-    // Write task: drain mpsc into the framed writer.
     let write_join = tokio::task::spawn_local(async move {
         if let Some(initial) = initial {
             if writer.send((initial.tag, initial.payload)).await.is_err() {
@@ -490,7 +413,6 @@ async fn client_task(
         }
     });
 
-    // Read loop: decoded frames straight from the codec, forwarded to daemon.
     while let Some(item) = reader.next().await {
         let (tag, payload) = match item {
             Ok(f) => f,
@@ -514,11 +436,7 @@ async fn client_task(
     write_join.abort();
 }
 
-async fn daemon_main(
-    mut state: DaemonState,
-    listener: UnixListener,
-    pty_master: OwnedFd,
-) {
+async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master: OwnedFd) {
     let pty_async = match AsyncFd::new(pty_master) {
         Ok(fd) => fd,
         Err(e) => {
@@ -705,6 +623,10 @@ async fn daemon_main(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Process-level entry points
+// ---------------------------------------------------------------------------
+
 fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     ignore_signal(Signal::SIGPIPE);
 
@@ -781,9 +703,6 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
         empty_timeout,
     };
 
-    // Convert the inherited server fd into a tokio-managed listener. The
-    // OwnedFd taken by from_raw_fd is consumed by UnixListener, which closes
-    // it on drop.
     let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(server_fd) };
     if let Err(e) = std_listener.set_nonblocking(true) {
         log::error!("failed to set listener nonblock: {}", e);
@@ -879,272 +798,4 @@ pub fn spawn_daemon_detached(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
     fork_daemon(cfg, cmd)?;
     println!("session '{}' created", cfg.session_name);
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Client
-// ---------------------------------------------------------------------------
-
-/// No-close wrapper so `AsyncFd<StdioFd>` can register stdin/stdout with the
-/// reactor without taking ownership of the fd. Dropping the wrapper does
-/// NOT close the underlying fd — the OS still owns process stdio.
-struct StdioFd(RawFd);
-impl AsRawFd for StdioFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
-
-pub fn run_client(socket: OwnedFd) -> i32 {
-    let socket_fd = socket.as_raw_fd();
-    let stdin_fd: RawFd = 0;
-    let stdout_fd: RawFd = 1;
-
-    if let Err(e) = socket::set_nonblock_and_cloexec(socket_fd) {
-        eprintln!("error: failed to set socket nonblock: {}", e);
-        return 1;
-    }
-    if let Err(e) = socket::set_nonblock_and_cloexec(stdout_fd) {
-        eprintln!("error: failed to set stdout nonblock: {}", e);
-        return 1;
-    }
-    if let Err(e) = socket::set_nonblock_and_cloexec(stdin_fd) {
-        eprintln!("error: failed to set stdin nonblock: {}", e);
-        return 1;
-    }
-    let _stdout_guard = NonBlockGuard { fd: stdout_fd };
-    let _stdin_guard = NonBlockGuard { fd: stdin_fd };
-
-    let saved = match enter_raw_mode(stdin_fd) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: failed to enter raw mode: {}", e);
-            return 1;
-        }
-    };
-    let _raw_guard = RawModeGuard {
-        fd: stdin_fd,
-        saved,
-    };
-
-    // Sanitize the terminal before session bytes start arriving. On reattach,
-    // the daemon will replay the full serialized state (Init), which paints
-    // whatever modes the session actually needs — but it can't reliably
-    // *unset* modes that were sticky on the local terminal (e.g. mouse
-    // tracking left on by fzf), so we start from a known-clean baseline.
-    write_terminal_reset(stdout_fd);
-
-    ignore_signal(Signal::SIGPIPE);
-
-    // Convert the connected socket into a tokio UnixStream. OwnedFd is
-    // consumed; the underlying fd lives on inside UnixStream until it drops.
-    let std_socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(socket.into_raw_fd()) };
-    if let Err(e) = std_socket.set_nonblocking(true) {
-        eprintln!("error: failed to set socket nonblock: {}", e);
-        return 1;
-    }
-
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("error: failed to build runtime: {}", e);
-            return 1;
-        }
-    };
-
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
-        let stream = match UnixStream::from_std(std_socket) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: failed to wrap socket: {}", e);
-                return;
-            }
-        };
-        client_async_main(stream, stdin_fd, stdout_fd).await;
-    });
-
-    // Programs in the session (starship, vim, mouse-aware tools) may have
-    // enabled DEC private modes that the detach path never gets to disable.
-    // Send the standard "be sane" set before we restore termios so the
-    // user's shell isn't stuck reporting mouse coords / hidden cursor.
-    write_terminal_reset(stdout_fd);
-    0
-}
-
-async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd) {
-    use futures_util::{SinkExt, StreamExt};
-
-    let (read_half, write_half) = stream.into_split();
-    let mut reader = FramedRead::new(read_half, RiftCodec);
-    let mut writer = FramedWrite::new(write_half, RiftCodec);
-
-    let stdin_async = match AsyncFd::new(StdioFd(stdin_fd)) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("error: failed to wrap stdin: {}", e);
-            return;
-        }
-    };
-    let stdout_async = match AsyncFd::new(StdioFd(stdout_fd)) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("error: failed to wrap stdout: {}", e);
-            return;
-        }
-    };
-
-    let mut sigwinch = match signal(SignalKind::window_change()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: failed to register SIGWINCH: {}", e);
-            return;
-        }
-    };
-
-    // Send initial size + ssh-auth-sock just like the sync client did.
-    let size = ipc::get_terminal_size(stdout_fd);
-    let _ = writer
-        .send((Tag::Resize, Bytes::copy_from_slice(&size.encode())))
-        .await;
-    if let Ok(ssh_auth_sock) = std::env::var("SSH_AUTH_SOCK") {
-        let _ = writer
-            .send((Tag::SshAuthSock, Bytes::copy_from_slice(ssh_auth_sock.as_bytes())))
-            .await;
-    }
-
-    let mut out_buf: Vec<u8> = Vec::new();
-    let mut stdin_buf = [0u8; 4096];
-
-    loop {
-        let has_pending = !out_buf.is_empty();
-
-        tokio::select! {
-            biased;
-
-            _ = sigwinch.recv() => {
-                let size = ipc::get_terminal_size(stdout_fd);
-                let _ = writer
-                    .send((Tag::Resize, Bytes::copy_from_slice(&size.encode())))
-                    .await;
-            }
-
-            ready = stdin_async.readable() => {
-                let mut guard = match ready {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-                let res = guard.try_io(|inner| {
-                    let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
-                    unistd::read(&bfd, &mut stdin_buf)
-                        .map_err(|e| io::Error::from_raw_os_error(e as i32))
-                });
-                match res {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
-                        let data = &stdin_buf[..n];
-                        if data.contains(&0x1c) || util::is_kitty_ctrl_backslash(data) {
-                            let _ = writer.send((Tag::Detach, Bytes::new())).await;
-                            break;
-                        }
-                        let _ = writer
-                            .send((Tag::Input, Bytes::copy_from_slice(data)))
-                            .await;
-                    }
-                    Ok(Err(_)) => break,
-                    Err(_would_block) => {}
-                }
-            }
-
-            item = reader.next() => {
-                let (tag, payload) = match item {
-                    Some(Ok(f)) => f,
-                    Some(Err(_)) | None => break,
-                };
-                match tag {
-                    Tag::Output | Tag::Init => {
-                        if out_buf.len() + payload.len() > MAX_OUT_BUF {
-                            let excess = out_buf.len() + payload.len() - MAX_OUT_BUF;
-                            out_buf.drain(..excess.min(out_buf.len()));
-                        }
-                        out_buf.extend_from_slice(&payload);
-                    }
-                    Tag::Detach => break,
-                    _ => {}
-                }
-            }
-
-            ready = stdout_async.writable(), if has_pending => {
-                let mut guard = match ready {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-                let res = guard.try_io(|inner| {
-                    let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
-                    unistd::write(&bfd, &out_buf)
-                        .map_err(|e| io::Error::from_raw_os_error(e as i32))
-                });
-                match res {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
-                        out_buf.drain(..n);
-                    }
-                    Ok(Err(_)) => break,
-                    Err(_would_block) => {}
-                }
-            }
-        }
-    }
-
-    // Final synchronous drain so any tail bytes reach the terminal before
-    // the runtime tears down (and write_terminal_reset writes over them).
-    let bfd = unsafe { BorrowedFd::borrow_raw(stdout_fd) };
-    while !out_buf.is_empty() {
-        match unistd::write(&bfd, &out_buf) {
-            Ok(n) if n > 0 => {
-                out_buf.drain(..n);
-            }
-            Err(nix::errno::Errno::EINTR) => continue,
-            _ => break,
-        }
-    }
-}
-
-fn write_terminal_reset(fd: RawFd) {
-    // Restore a sane terminal on detach: disable all common mouse-tracking
-    // variants, focus reporting, bracketed paste; exit alternate screen
-    // (both 1049 and the older 47); reset SGR; show the cursor; exit
-    // alternate keypad. DECSTR (`\e[!p`), cursor-home and scrolling-region
-    // reset were tried but triggered terminal status responses that got
-    // echoed back to the user's shell — keep this set minimal.
-    const RESET: &[u8] = b"\
-\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\
-\x1b[?2004l\
-\x1b[?1049l\x1b[?47l\
-\x1b[0m\
-\x1b[2J\x1b[H\
-\x1b[?25h\
-\x1b>";
-    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut written = 0;
-    while written < RESET.len() {
-        match unistd::write(&bfd, &RESET[written..]) {
-            Ok(n) if n > 0 => written += n,
-            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => continue,
-            _ => break,
-        }
-    }
-    // Drain so the reset bytes reach the terminal before we restore termios
-    // or exit; otherwise the kernel may discard them.
-    let _ = termios::tcdrain(&bfd);
-}
-
-fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }

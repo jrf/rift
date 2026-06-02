@@ -550,7 +550,8 @@ pub fn cmd_tail(names: &[String]) -> i32 {
         if let Some(revents) = poll_fds[0].revents() {
             if revents.contains(PollFlags::POLLIN) {
                 let mut buf = [0u8; 128];
-                if let Ok(n) = daemon::read_raw(0, &mut buf) {
+                let stdin_bfd = unsafe { BorrowedFd::borrow_raw(0) };
+                if let Ok(n) = nix::unistd::read(&stdin_bfd, &mut buf) {
                     if n > 0 && buf[..n].contains(&0x03) {
                         return 0;
                     }
