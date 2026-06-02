@@ -220,6 +220,22 @@ impl SocketBuffer {
         Ok(n)
     }
 
+    /// Append pre-read bytes into the buffer. Use when bytes are sourced
+    /// externally (e.g. an async `AsyncRead`) rather than via raw fd read.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        if self.head > 0 {
+            let remaining = self.buf.len() - self.head;
+            if remaining > 0 {
+                self.buf.copy_within(self.head.., 0);
+                self.buf.truncate(remaining);
+            } else {
+                self.buf.clear();
+            }
+            self.head = 0;
+        }
+        self.buf.extend_from_slice(bytes);
+    }
+
     /// Returns the next complete message or None.
     /// The returned slice borrows from the buffer; convert with `.to_vec()`
     /// if you need to release the borrow before the next iteration.

@@ -1,13 +1,21 @@
+use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::sys::termios::{self, SetArg, Termios};
 use nix::unistd;
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc;
+use tokio::time::{self, Duration, Instant};
 
 use crate::ipc::{self, SocketBuffer, Tag};
 use crate::socket;
@@ -274,58 +282,34 @@ fn spawn_pty(
 // Daemon
 // ---------------------------------------------------------------------------
 
-/// Per-client outgoing buffer cap. Above this, the client is dropped on the
-/// next send to prevent unbounded growth from a stalled reader.
+/// Per-client outgoing channel cap. Above this, the slow client is dropped
+/// to prevent unbounded memory growth.
+const CLIENT_TX_BUF: usize = 256;
+const PTY_READ_BUF: usize = 4096;
+/// Client-side output buffer cap (used by `client_loop` when stdout can't
+/// keep up).
 const MAX_OUT_BUF: usize = 4 * 1024 * 1024;
 
-struct ClientConn {
-    fd: OwnedFd,
-    buf: SocketBuffer,
-    out_buf: Vec<u8>,
+/// Message from a client task back to the daemon main task.
+enum ClientMsg {
+    Frame { tag: Tag, payload: Vec<u8> },
+    /// Read loop ended (socket EOF, error, or write task crashed).
+    Gone,
 }
 
-impl ClientConn {
-    /// Append a message to out_buf. Returns false if the buffer would exceed
-    /// MAX_OUT_BUF — caller should remove the client.
-    fn queue_send(&mut self, tag: Tag, data: &[u8]) -> bool {
-        let total = ipc::HEADER_SIZE + data.len();
-        if self.out_buf.len() + total > MAX_OUT_BUF {
-            return false;
-        }
-        let header = ipc::encode_header(tag, data.len() as u32);
-        self.out_buf.extend_from_slice(&header);
-        self.out_buf.extend_from_slice(data);
-        true
-    }
-
-    /// Drain out_buf via non-blocking write. Returns false on permanent error
-    /// (caller should remove the client). EAGAIN leaves remainder queued.
-    fn flush(&mut self) -> bool {
-        let bfd = unsafe { BorrowedFd::borrow_raw(self.fd.as_raw_fd()) };
-        while !self.out_buf.is_empty() {
-            match unistd::write(&bfd, &self.out_buf) {
-                Ok(0) => return false,
-                Ok(n) => {
-                    self.out_buf.drain(..n);
-                }
-                Err(nix::errno::Errno::EAGAIN) => return true,
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(_) => return false,
-            }
-        }
-        true
-    }
-
-    fn wants_write(&self) -> bool {
-        !self.out_buf.is_empty()
-    }
+/// Frame queued for delivery to a client task's socket.
+#[derive(Clone)]
+struct DaemonFrame {
+    tag: Tag,
+    payload: Bytes,
 }
 
-pub struct Daemon {
-    server_fd: RawFd,
-    pty_master_fd: RawFd,
+/// State owned exclusively by the daemon's main task. Because the runtime
+/// is single-threaded (`current_thread`), nothing here needs to be `Send`
+/// or wrapped in a mutex.
+struct DaemonState {
     child_pid: libc::pid_t,
-    clients: Vec<ClientConn>,
+    pty_master_fd: RawFd, // owned by AsyncFd in daemon_main; held here for ioctl/write
     parser: vt100::Parser,
     session_name: String,
     socket_dir: PathBuf,
@@ -336,43 +320,12 @@ pub struct Daemon {
     task_exit_code: u8,
     child_exited: bool,
     has_had_client: bool,
-    signal_read_fd: RawFd,
+    clients: HashMap<u64, mpsc::Sender<DaemonFrame>>,
     last_client_disconnected_at: Option<u64>,
     empty_timeout: Option<u64>,
 }
 
-impl Daemon {
-    fn broadcast(&mut self, tag: Tag, data: &[u8]) {
-        let mut remove = Vec::new();
-        for (i, client) in self.clients.iter_mut().enumerate() {
-            if !client.queue_send(tag, data) {
-                remove.push(i);
-            }
-        }
-        for i in remove.into_iter().rev() {
-            let c = self.clients.remove(i);
-            log::info!(
-                "client disconnected (out buffer full), fd={}",
-                c.fd.as_raw_fd()
-            );
-        }
-    }
-
-    /// Opportunistically drain out_bufs after each event loop iteration so
-    /// data goes out promptly without waiting for the next poll round.
-    fn flush_clients(&mut self) {
-        let mut remove = Vec::new();
-        for (i, client) in self.clients.iter_mut().enumerate() {
-            if client.wants_write() && !client.flush() {
-                remove.push(i);
-            }
-        }
-        for i in remove.into_iter().rev() {
-            let c = self.clients.remove(i);
-            log::info!("client disconnected (write error), fd={}", c.fd.as_raw_fd());
-        }
-    }
-
+impl DaemonState {
     fn build_info(&self) -> ipc::Info {
         ipc::Info {
             clients_len: self.clients.len(),
@@ -385,24 +338,36 @@ impl Daemon {
         }
     }
 
-    fn send_info(&mut self, i: usize) {
-        let payload = self.build_info().encode();
-        let _ = self.clients[i].queue_send(Tag::Info, &payload);
+    /// Send a frame to every connected client. Drops clients whose channels
+    /// are full (slow reader, exceeded backpressure budget) or closed.
+    fn broadcast(&mut self, frame: DaemonFrame) {
+        self.clients
+            .retain(|_id, tx| tx.try_send(frame.clone()).is_ok());
     }
 
-    fn handle_signal(&mut self) {
-        let mut buf = [0u8; 64];
-        let _ = read_raw(self.signal_read_fd, &mut buf);
+    /// Send a frame to a specific client. Drops the client on failure.
+    fn send_to(&mut self, id: u64, frame: DaemonFrame) {
+        let drop_it = match self.clients.get(&id) {
+            Some(tx) => tx.try_send(frame).is_err(),
+            None => false,
+        };
+        if drop_it {
+            self.clients.remove(&id);
+        }
+    }
 
+    /// Reap the child after SIGCHLD. Sets `child_exited` and records exit
+    /// code; no-op if no child reaped yet (handler can fire on stops too).
+    fn reap_child(&mut self) {
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(self.child_pid, &mut status, libc::WNOHANG) };
         if r > 0 {
             self.child_exited = true;
-            if libc::WIFEXITED(status) {
-                self.task_exit_code = libc::WEXITSTATUS(status) as u8;
+            self.task_exit_code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status) as u8
             } else {
-                self.task_exit_code = 1;
-            }
+                1
+            };
             self.task_ended_at = now_epoch();
             log::info!(
                 "child exited, pid={} exit_code={}",
@@ -412,293 +377,384 @@ impl Daemon {
         }
     }
 
-    fn handle_server(&mut self) {
-        loop {
-            let r =
-                unsafe { libc::accept(self.server_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
-            if r < 0 {
-                break;
-            }
-            let client_fd = unsafe { OwnedFd::from_raw_fd(r) };
-            if let Err(e) = socket::set_nonblock_and_cloexec(client_fd.as_raw_fd()) {
-                log::warn!("failed to set flags on client fd: {}", e);
-                continue;
-            }
-            log::info!("client connected, fd={}", client_fd.as_raw_fd());
-
-            let mut client = ClientConn {
-                fd: client_fd,
-                buf: SocketBuffer::new(),
-                out_buf: Vec::new(),
-            };
-
-            if self.has_had_client {
-                if let Some(state) = util::serialize_terminal_state(&self.parser) {
-                    let _ = client.queue_send(Tag::Init, &state);
-                }
-            }
-            self.has_had_client = true;
-
-            self.clients.push(client);
+    /// Feed PTY bytes into the parser, broadcast to clients, scan for the
+    /// task-exit marker. Returns `true` if there are no clients attached
+    /// (so the caller should answer any pending DA queries directly).
+    fn on_pty_bytes(&mut self, data: &[u8]) -> bool {
+        self.parser.process(data);
+        if let Some(code) = util::find_task_exit_marker(data) {
+            self.task_exit_code = code;
+            self.task_ended_at = now_epoch();
+            log::info!("task exit marker found, code={}", code);
         }
+        self.broadcast(DaemonFrame {
+            tag: Tag::Output,
+            payload: Bytes::copy_from_slice(data),
+        });
+        self.clients.is_empty()
     }
 
-    fn handle_pty_output(&mut self) -> bool {
-        let mut buf = [0u8; 4096];
-        match read_raw(self.pty_master_fd, &mut buf) {
-            Ok(0) => {
-                log::info!("pty master returned EOF");
-                return true;
+    /// Dispatch a parsed protocol frame from client `id`.
+    fn handle_client_frame(&mut self, id: u64, tag: Tag, payload: Vec<u8>) {
+        match tag {
+            Tag::Input => {
+                let _ = ipc::write_all(self.pty_master_fd, &payload);
             }
-            Ok(n) => {
-                let data = &buf[..n];
-                self.parser.process(data);
-
-                if let Some(code) = util::find_task_exit_marker(data) {
-                    self.task_exit_code = code;
-                    self.task_ended_at = now_epoch();
-                    log::info!("task exit marker found, code={}", code);
-                }
-
-                self.broadcast(Tag::Output, data);
-
-                if self.clients.is_empty() {
-                    util::respond_to_device_attributes(self.pty_master_fd, data);
+            Tag::Resize => {
+                if let Some(r) = ipc::Resize::decode(&payload) {
+                    self.parser.screen_mut().set_size(r.rows, r.cols);
+                    let ws = libc::winsize {
+                        ws_row: r.rows,
+                        ws_col: r.cols,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    };
+                    unsafe {
+                        libc::ioctl(self.pty_master_fd, libc::TIOCSWINSZ, &ws);
+                    }
                 }
             }
-            Err(nix::errno::Errno::EIO) => {
-                log::info!("pty master returned EIO (child exited)");
-                return true;
-            }
-            Err(nix::errno::Errno::EAGAIN) => {}
-            Err(e) => {
-                log::warn!("pty read error: {}", e);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn handle_client_data(&mut self, client_poll_fds: &[PollFd]) {
-        let mut remove = Vec::new();
-        for i in 0..self.clients.len() {
-            if i >= client_poll_fds.len() {
-                break;
-            }
-            let revents = match client_poll_fds[i].revents() {
-                Some(r) => r,
-                None => continue,
-            };
-            if revents.contains(PollFlags::POLLERR) {
-                log::info!(
-                    "client disconnected (poll error), fd={}",
-                    self.clients[i].fd.as_raw_fd()
+            Tag::Detach => {
+                log::info!("client requested detach, id={}", id);
+                self.send_to(
+                    id,
+                    DaemonFrame {
+                        tag: Tag::Detach,
+                        payload: Bytes::new(),
+                    },
                 );
-                remove.push(i);
-                continue;
+                self.clients.remove(&id);
             }
-            if revents.contains(PollFlags::POLLOUT) && !self.clients[i].flush() {
-                log::info!(
-                    "client disconnected (write error), fd={}",
-                    self.clients[i].fd.as_raw_fd()
+            Tag::DetachAll => {
+                log::info!("client requested detach-all");
+                self.broadcast(DaemonFrame {
+                    tag: Tag::Detach,
+                    payload: Bytes::new(),
+                });
+                self.clients.clear();
+            }
+            Tag::Kill => {
+                log::info!("kill requested");
+                unsafe {
+                    libc::kill(self.child_pid, libc::SIGTERM);
+                }
+            }
+            Tag::Info => {
+                let payload = Bytes::from(self.build_info().encode());
+                self.send_to(
+                    id,
+                    DaemonFrame {
+                        tag: Tag::Info,
+                        payload,
+                    },
                 );
-                remove.push(i);
-                continue;
             }
-            if !revents.contains(PollFlags::POLLIN) && !revents.contains(PollFlags::POLLHUP) {
-                continue;
+            Tag::History => {
+                let format = if payload.is_empty() {
+                    util::HistoryFormat::Plain
+                } else {
+                    match payload[0] {
+                        1 => util::HistoryFormat::Vt,
+                        2 => util::HistoryFormat::Html,
+                        _ => util::HistoryFormat::Plain,
+                    }
+                };
+                let data = util::serialize_terminal(&self.parser, format).unwrap_or_default();
+                self.send_to(
+                    id,
+                    DaemonFrame {
+                        tag: Tag::History,
+                        payload: Bytes::from(data),
+                    },
+                );
             }
-
-            let client_fd = self.clients[i].fd.as_raw_fd();
-            match self.clients[i].buf.read(client_fd) {
-                Ok(0) => {
-                    log::info!("client disconnected, fd={}", client_fd);
-                    remove.push(i);
-                    continue;
-                }
-                Ok(_) => {}
-                Err(nix::errno::Errno::EAGAIN) => continue,
-                Err(_) => {
-                    remove.push(i);
-                    continue;
-                }
-            }
-
-            while let Some((tag, payload)) = self.clients[i].buf.next() {
-                let payload = payload.to_vec();
-                match tag {
-                    Tag::Input => {
-                        let _ = ipc::write_all(self.pty_master_fd, &payload);
-                    }
-                    Tag::Resize => {
-                        if let Some(resize) = ipc::Resize::decode(&payload) {
-                            self.parser.screen_mut().set_size(resize.rows, resize.cols);
-                            let ws = libc::winsize {
-                                ws_row: resize.rows,
-                                ws_col: resize.cols,
-                                ws_xpixel: 0,
-                                ws_ypixel: 0,
-                            };
-                            unsafe {
-                                libc::ioctl(self.pty_master_fd, libc::TIOCSWINSZ, &ws);
-                            }
-                        }
-                    }
-                    Tag::Detach => {
-                        log::info!("client requested detach, fd={}", client_fd);
-                        let _ = self.clients[i].queue_send(Tag::Detach, &[]);
-                        remove.push(i);
-                    }
-                    Tag::DetachAll => {
-                        log::info!("client requested detach-all");
-                        for j in 0..self.clients.len() {
-                            let _ = self.clients[j].queue_send(Tag::Detach, &[]);
-                        }
-                        remove.extend(0..self.clients.len());
-                        break;
-                    }
-                    Tag::Kill => {
-                        log::info!("kill requested");
-                        unsafe {
-                            libc::kill(self.child_pid, libc::SIGTERM);
-                        }
-                    }
-                    Tag::Info => {
-                        self.send_info(i);
-                    }
-                    Tag::History => {
-                        let format = if payload.is_empty() {
-                            util::HistoryFormat::Plain
-                        } else {
-                            match payload[0] {
-                                1 => util::HistoryFormat::Vt,
-                                2 => util::HistoryFormat::Html,
-                                _ => util::HistoryFormat::Plain,
-                            }
-                        };
-                        let data =
-                            util::serialize_terminal(&self.parser, format).unwrap_or_default();
-                        let _ = self.clients[i].queue_send(Tag::History, &data);
-                    }
-                    Tag::Print => {
-                        if !payload.is_empty() {
-                            self.parser.process(&payload);
-                            self.broadcast(Tag::Output, &payload);
-                        }
-                    }
-                    Tag::Run => {
-                        if !payload.is_empty() {
-                            let _ = ipc::write_all(self.pty_master_fd, &payload);
-                        }
-                    }
-                    Tag::SshAuthSock => {
-                        if !payload.is_empty() {
-                            if let Ok(path) = std::str::from_utf8(&payload) {
-                                socket::update_ssh_auth_sock_symlink(
-                                    &self.socket_dir,
-                                    &self.session_name,
-                                    path,
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
+            Tag::Print => {
+                if !payload.is_empty() {
+                    self.parser.process(&payload);
+                    self.broadcast(DaemonFrame {
+                        tag: Tag::Output,
+                        payload: Bytes::copy_from_slice(&payload),
+                    });
                 }
             }
-        }
-
-        remove.sort_unstable();
-        remove.dedup();
-        for i in remove.into_iter().rev() {
-            self.clients.remove(i);
+            Tag::Run => {
+                if !payload.is_empty() {
+                    let _ = ipc::write_all(self.pty_master_fd, &payload);
+                }
+            }
+            Tag::SshAuthSock => {
+                if !payload.is_empty() {
+                    if let Ok(path) = std::str::from_utf8(&payload) {
+                        socket::update_ssh_auth_sock_symlink(
+                            &self.socket_dir,
+                            &self.session_name,
+                            path,
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
 
-fn daemon_loop(daemon: &mut Daemon) {
+/// Per-client task: owns the UnixStream, reads frames into the daemon via
+/// `daemon_tx`, writes outbound frames received on its own channel.
+async fn client_task(
+    stream: UnixStream,
+    id: u64,
+    initial: Option<DaemonFrame>,
+    mut rx: mpsc::Receiver<DaemonFrame>,
+    daemon_tx: mpsc::UnboundedSender<(u64, ClientMsg)>,
+) {
+    let (read_half, mut write_half) = stream.into_split();
+
+    // Write task: serialize DaemonFrames into the wire protocol.
+    let write_join = tokio::task::spawn_local(async move {
+        if let Some(initial) = initial {
+            let header = ipc::encode_header(initial.tag, initial.payload.len() as u32);
+            if write_half.write_all(&header).await.is_err() {
+                return;
+            }
+            if write_half.write_all(&initial.payload).await.is_err() {
+                return;
+            }
+        }
+        while let Some(frame) = rx.recv().await {
+            let header = ipc::encode_header(frame.tag, frame.payload.len() as u32);
+            if write_half.write_all(&header).await.is_err() {
+                break;
+            }
+            if write_half.write_all(&frame.payload).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let _ = client_read_loop(read_half, id, daemon_tx.clone()).await;
+
+    let _ = daemon_tx.send((id, ClientMsg::Gone));
+    write_join.abort();
+}
+
+async fn client_read_loop(
+    mut read_half: tokio::net::unix::OwnedReadHalf,
+    id: u64,
+    daemon_tx: mpsc::UnboundedSender<(u64, ClientMsg)>,
+) -> io::Result<()> {
+    let mut buf = SocketBuffer::new();
+    let mut tmp = [0u8; 4096];
     loop {
-        let sig_bfd = unsafe { BorrowedFd::borrow_raw(daemon.signal_read_fd) };
-        let srv_bfd = unsafe { BorrowedFd::borrow_raw(daemon.server_fd) };
-        let pty_bfd = unsafe { BorrowedFd::borrow_raw(daemon.pty_master_fd) };
-
-        let mut poll_fds = vec![
-            PollFd::new(sig_bfd, PollFlags::POLLIN),
-            PollFd::new(srv_bfd, PollFlags::POLLIN),
-            PollFd::new(pty_bfd, PollFlags::POLLIN),
-        ];
-
-        for client in &daemon.clients {
-            let bfd = unsafe { BorrowedFd::borrow_raw(client.fd.as_raw_fd()) };
-            let flags = if client.wants_write() {
-                PollFlags::POLLIN | PollFlags::POLLOUT
-            } else {
-                PollFlags::POLLIN
-            };
-            poll_fds.push(PollFd::new(bfd, flags));
+        let n = read_half.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(());
         }
+        buf.feed(&tmp[..n]);
+        while let Some((tag, payload)) = buf.next() {
+            if daemon_tx
+                .send((
+                    id,
+                    ClientMsg::Frame {
+                        tag,
+                        payload: payload.to_vec(),
+                    },
+                ))
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+    }
+}
 
-        let mut poll_timeout = PollTimeout::NONE;
-        if let (Some(dis_at), Some(limit)) =
-            (daemon.last_client_disconnected_at, daemon.empty_timeout)
-        {
-            let elapsed = now_epoch().saturating_sub(dis_at);
-            if elapsed >= limit {
-                log::info!(
-                    "empty session timeout of {}s reached, self-terminating",
-                    limit
-                );
+async fn daemon_main(
+    mut state: DaemonState,
+    listener: UnixListener,
+    pty_master: OwnedFd,
+) {
+    let pty_async = match AsyncFd::new(pty_master) {
+        Ok(fd) => fd,
+        Err(e) => {
+            log::error!("failed to wrap pty master in AsyncFd: {}", e);
+            return;
+        }
+    };
+
+    let mut sigchld = match signal(SignalKind::child()) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("failed to register SIGCHLD: {}", e);
+            return;
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("failed to register SIGTERM: {}", e);
+            return;
+        }
+    };
+
+    let (daemon_tx, mut daemon_rx) = mpsc::unbounded_channel::<(u64, ClientMsg)>();
+    let mut next_client_id: u64 = 0;
+    let mut pty_buf = vec![0u8; PTY_READ_BUF];
+
+    loop {
+        // Compute deadline for empty-session self-termination, if armed.
+        let empty_deadline = state
+            .last_client_disconnected_at
+            .zip(state.empty_timeout)
+            .map(|(disc, lim)| {
+                let elapsed = now_epoch().saturating_sub(disc);
+                if elapsed >= lim {
+                    Instant::now()
+                } else {
+                    Instant::now() + Duration::from_secs(lim - elapsed)
+                }
+            });
+
+        tokio::select! {
+            biased;
+
+            _ = sigterm.recv() => {
+                log::info!("SIGTERM received");
                 break;
-            } else {
-                let remaining_secs = limit - elapsed;
-                let remaining_ms = std::cmp::min(remaining_secs, 30) * 1000;
-                poll_timeout = PollTimeout::from(remaining_ms as u16);
             }
-        }
 
-        match poll(&mut poll_fds, poll_timeout) {
-            Ok(_) => {}
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => {
-                log::error!("poll error: {}", e);
-                break;
+            _ = sigchld.recv() => {
+                state.reap_child();
             }
-        }
 
-        if let Some(revents) = poll_fds[0].revents() {
-            if revents.contains(PollFlags::POLLIN) {
-                daemon.handle_signal();
-            }
-        }
-
-        if let Some(revents) = poll_fds[1].revents() {
-            if revents.contains(PollFlags::POLLIN) {
-                daemon.handle_server();
-            }
-        }
-
-        if let Some(revents) = poll_fds[2].revents() {
-            if revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP) {
-                if daemon.handle_pty_output() {
-                    break;
+            Some((id, msg)) = daemon_rx.recv() => {
+                match msg {
+                    ClientMsg::Frame { tag, payload } => {
+                        state.handle_client_frame(id, tag, payload);
+                    }
+                    ClientMsg::Gone => {
+                        if state.clients.remove(&id).is_some() {
+                            log::info!("client disconnected, id={}", id);
+                        }
+                    }
                 }
             }
+
+            ready = pty_async.readable() => {
+                match ready {
+                    Ok(mut guard) => {
+                        let res = guard.try_io(|inner| {
+                            let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
+                            unistd::read(&bfd, &mut pty_buf)
+                                .map_err(|e| io::Error::from_raw_os_error(e as i32))
+                        });
+                        match res {
+                            Ok(Ok(0)) => {
+                                log::info!("pty master EOF");
+                                break;
+                            }
+                            Ok(Ok(n)) => {
+                                let no_clients = state.on_pty_bytes(&pty_buf[..n]);
+                                if no_clients {
+                                    util::respond_to_device_attributes(
+                                        state.pty_master_fd,
+                                        &pty_buf[..n],
+                                    );
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                if e.raw_os_error() == Some(libc::EIO) {
+                                    log::info!("pty master EIO (child exited)");
+                                    break;
+                                }
+                                log::warn!("pty read error: {}", e);
+                                break;
+                            }
+                            Err(_would_block) => {
+                                // false readiness; loop and re-await
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("pty readable error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _addr)) => {
+                        let id = next_client_id;
+                        next_client_id += 1;
+                        let (tx, rx) = mpsc::channel(CLIENT_TX_BUF);
+
+                        let initial = if state.has_had_client {
+                            util::serialize_terminal_state(&state.parser).map(|s| DaemonFrame {
+                                tag: Tag::Init,
+                                payload: Bytes::from(s),
+                            })
+                        } else {
+                            None
+                        };
+                        state.has_had_client = true;
+                        state.clients.insert(id, tx);
+                        log::info!("client connected, id={}", id);
+
+                        let dtx = daemon_tx.clone();
+                        tokio::task::spawn_local(async move {
+                            client_task(stream, id, initial, rx, dtx).await;
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("accept error: {}", e);
+                    }
+                }
+            }
+
+            // Empty-session self-termination. When no deadline is armed,
+            // this branch never fires (pending future).
+            _ = async {
+                match empty_deadline {
+                    Some(d) => time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                log::info!(
+                    "empty session timeout of {}s reached, self-terminating",
+                    state.empty_timeout.unwrap_or(0)
+                );
+                break;
+            }
         }
 
-        daemon.handle_client_data(&poll_fds[3..]);
-        daemon.flush_clients();
-
-        if daemon.clients.is_empty() {
-            if daemon.has_had_client && daemon.last_client_disconnected_at.is_none() {
-                daemon.last_client_disconnected_at = Some(now_epoch());
+        // Track empty-state transitions for the timeout deadline.
+        if state.clients.is_empty() {
+            if state.has_had_client && state.last_client_disconnected_at.is_none() {
+                state.last_client_disconnected_at = Some(now_epoch());
             }
         } else {
-            daemon.last_client_disconnected_at = None;
+            state.last_client_disconnected_at = None;
         }
 
-        if daemon.child_exited {
-            let _ = daemon.handle_pty_output();
+        if state.child_exited {
+            // Drain a final non-blocking read so any trailing output reaches
+            // attached clients before we tear down.
+            let bfd = unsafe { BorrowedFd::borrow_raw(state.pty_master_fd) };
+            if let Ok(n) = unistd::read(&bfd, &mut pty_buf) {
+                if n > 0 {
+                    state.on_pty_bytes(&pty_buf[..n]);
+                }
+            }
             break;
         }
+    }
+
+    // Notify any still-attached clients to detach gracefully.
+    let detach = DaemonFrame {
+        tag: Tag::Detach,
+        payload: Bytes::new(),
+    };
+    for (_id, tx) in state.clients.drain() {
+        let _ = tx.try_send(detach.clone());
     }
 }
 
@@ -720,15 +776,15 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     } else {
         cmd[1..].iter().map(|s| s.as_str()).collect()
     };
-    let (master_fd, child_pid) = match spawn_pty(spawn_cmd, &spawn_args, 24, 80, &cfg.session_name)
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: failed to spawn pty: {}", e);
-            let _ = std::fs::remove_file(&cfg.socket_path);
-            return;
-        }
-    };
+    let (master_fd, child_pid) =
+        match spawn_pty(spawn_cmd, &spawn_args, 24, 80, &cfg.session_name) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: failed to spawn pty: {}", e);
+                let _ = std::fs::remove_file(&cfg.socket_path);
+                return;
+            }
+        };
 
     let early_output = drain_da_queries(master_fd);
 
@@ -745,21 +801,9 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
 
     log::info!("daemon starting, session={}", cfg.session_name);
 
-    let (sig_read, _sig_write) = match create_signal_pipe() {
-        Ok(fds) => fds,
-        Err(e) => {
-            log::error!("failed to create signal pipe: {}", e);
-            return;
-        }
-    };
-
-    install_signal_handler(Signal::SIGCHLD);
-    install_signal_handler(Signal::SIGTERM);
-
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-
     let display_cmd = if cmd.is_empty() {
         shell.clone()
     } else {
@@ -767,12 +811,15 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     };
     log::info!("child spawned, pid={} cmd={}", child_pid, display_cmd);
 
-    let mut daemon = Daemon {
-        server_fd,
-        pty_master_fd: master_fd,
+    let mut parser = vt100::Parser::new(24, 80, 1000);
+    if !early_output.is_empty() {
+        parser.process(&early_output);
+    }
+
+    let state = DaemonState {
         child_pid,
-        clients: Vec::new(),
-        parser: vt100::Parser::new(24, 80, 1000),
+        pty_master_fd: master_fd,
+        parser,
         session_name: cfg.session_name.clone(),
         socket_dir: cfg.socket_dir.clone(),
         shell_cmd: display_cmd,
@@ -782,29 +829,48 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
         task_exit_code: 0,
         child_exited: false,
         has_had_client: false,
-        signal_read_fd: sig_read,
+        clients: HashMap::new(),
         last_client_disconnected_at: None,
         empty_timeout,
     };
 
-    if !early_output.is_empty() {
-        daemon.parser.process(&early_output);
+    // Convert the inherited server fd into a tokio-managed listener. The
+    // OwnedFd taken by from_raw_fd is consumed by UnixListener, which closes
+    // it on drop.
+    let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(server_fd) };
+    if let Err(e) = std_listener.set_nonblocking(true) {
+        log::error!("failed to set listener nonblock: {}", e);
+        return;
     }
 
-    daemon_loop(&mut daemon);
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            log::error!("failed to build runtime: {}", e);
+            return;
+        }
+    };
 
-    log::info!("daemon exiting, session={}", daemon.session_name);
+    let local = tokio::task::LocalSet::new();
+    let session_name = cfg.session_name.clone();
+    local.block_on(&rt, async move {
+        let listener = match UnixListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(e) => {
+                log::error!("failed to convert listener: {}", e);
+                return;
+            }
+        };
+        // SAFETY: master_fd was just produced by spawn_pty and is not owned
+        // elsewhere. OwnedFd will close it when AsyncFd is dropped.
+        let pty_owned = unsafe { OwnedFd::from_raw_fd(master_fd) };
+        daemon_main(state, listener, pty_owned).await;
+    });
 
-    for c in daemon.clients.iter_mut() {
-        let _ = c.queue_send(Tag::Detach, &[]);
-        let _ = c.flush();
-    }
-    daemon.clients.clear();
-
-    unsafe {
-        libc::close(daemon.pty_master_fd);
-        libc::close(daemon.server_fd);
-    }
+    log::info!("daemon exiting, session={}", session_name);
 
     let _ = std::fs::remove_file(&cfg.socket_path);
     let symlink_path = cfg
