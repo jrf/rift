@@ -91,9 +91,9 @@ When the session is spawned, `rift` configures the shell's `SSH_AUTH_SOCK` to po
 └──────────┘                     └──────────┘              └───────┘
 ```
 
-The daemon forks on first attach, creates a PTY, and spawns a shell. It runs a single `poll()` loop over: signal pipe, server socket, PTY master, and all client fds. Terminal state is tracked via a vt100 parser and replayed on reattach.
+The daemon forks on first attach, creates a PTY, and spawns a shell. Both daemon and client run on a single-threaded tokio runtime (`current_thread` + `LocalSet`). The daemon's main task multiplexes the listening socket, PTY master (`AsyncFd<OwnedFd>`), and `SIGCHLD`/`SIGTERM` via `tokio::select!`; each accepted client is its own task that talks back through an mpsc channel. Terminal state is tracked via a vt100 parser and replayed to reattaching clients.
 
-Sessions are identified by name and communicate over a binary protocol (5-byte header: 1 tag + 4 LE length + payload).
+Sessions are identified by name and communicate over a binary protocol (5-byte header: 1 tag + 4 LE length + payload). Framing is handled by `tokio-util::codec` (`ipc::RiftCodec`).
 
 ## Using with Terminal Emulators
 
