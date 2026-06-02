@@ -21,6 +21,7 @@ remote session after a local reboot.
 | `fish/functions/rift-load-snapshot.fish` | `rift-load-snapshot [file]` — open a new OS window from a saved snapshot. |
 | `kitty/rift-snapshot.py` | Helper invoked by `rift-snapshot` to turn `kitten @ ls` JSON into a kitty session file. |
 | `bash/rift-autostart.bash` | The equivalent autostart hook for remote bash. Append to the *top* of `~/.bashrc` on every host you ssh into. |
+| `bash/rift-aliases.bash` | The complete set of bash aliases and functions. |
 
 ## Install (one-time, per machine)
 
@@ -40,6 +41,9 @@ ln -s "$PWD/scripts/fish/conf.d/rift-autostart.fish"     ~/.config/fish/conf.d/
 ln -s "$PWD/scripts/fish/functions/r.fish"                ~/.config/fish/functions/
 ln -s "$PWD/scripts/fish/functions/rift-restore.fish"     ~/.config/fish/functions/
 ln -s "$PWD/scripts/fish/functions/rift-pick.fish"        ~/.config/fish/functions/
+
+# bash (if you use bash instead of fish)
+# ln -s "$PWD/scripts/bash/rift-aliases.bash"            ~/.bash_aliases
 
 # on each remote you ssh into:
 scp scripts/rift-pane <host>:~/.local/bin/
