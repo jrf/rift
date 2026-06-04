@@ -27,6 +27,7 @@ enum Command {
     Wait { names: Vec<String> },
     Completions { shell: String },
     Logs { name: String, extra: Vec<String> },
+    Last,
     Version,
     Help,
 }
@@ -181,6 +182,7 @@ fn parse_args() -> Command {
             let extra = args[2..].to_vec();
             Command::Logs { name, extra }
         }
+        "last" | "la" => Command::Last,
         "new" | "n" => {
             if args.len() < 2 {
                 eprintln!("error: new requires a session name");
@@ -244,6 +246,7 @@ fn main() {
         Command::Rename { name, new_name } => commands::cmd_rename(&name, &new_name),
         Command::Completions { shell } => { completions::print_completions(&shell); 0 }
         Command::Logs { name, extra } => commands::cmd_logs(&name, &extra),
+        Command::Last => commands::cmd_last(),
         Command::Attach { name, detached, cmd } => commands::cmd_attach(&name, detached, &cmd),
     };
     std::process::exit(code);
@@ -267,6 +270,7 @@ Usage:
   rift tail|t <name>...         Follow session output in real-time
   rift history|hi <session>     Print session output (--vt, --html)
   rift logs|lg <session> [...]  Tail -f the session log file (extra args pass to tail)
+  rift last|la                  Attach to the most recently attached session
   rift detach|d [<session>]     Detach all clients from a session
   rift rename|rn [<old_name>] <new_name> Rename a session (defaults to $RIFT_SESSION)
   rift kill|k <name>...         Kill sessions (-f to force)

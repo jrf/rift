@@ -9,6 +9,7 @@
 ## Scrapped
 
 ## Done
+- [x] `last` / `la` — re-attach to the most recently attached session (state file `<socket_dir>/.last`) #feature
 - [x] `logs` / `lg` — shortcut for `tail -f` on the session's log file, with extra args passed through to `tail` #feature
 - [x] Rename sessions — `rift rename [<old_name>] <new_name>` (alias `rn`) dynamically renames active sessions, including Unix sockets, logs, and symlinks #feature
 - [x] Migrate daemon and client to async tokio runtime (current_thread + LocalSet, per-client tasks via mpsc, `tokio-util` codec for the wire protocol) #refactor

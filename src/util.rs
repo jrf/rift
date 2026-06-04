@@ -248,6 +248,28 @@ pub fn pattern_matches(patterns: &[String], name: &str) -> bool {
     })
 }
 
+// -- Last-session state file --------------------------------------------------
+//
+// We record the bare (pre-prefix) session name of the most recent successful
+// attach in `<socket_dir>/.last`, so `rift last` can re-attach to it. Stored
+// pre-prefix because `cmd_attach` re-applies the current `RIFT_SESSION_PREFIX`.
+
+pub fn write_last_session(socket_dir: &Path, bare_name: &str) {
+    let path = socket_dir.join(".last");
+    let _ = std::fs::write(path, bare_name);
+}
+
+pub fn read_last_session(socket_dir: &Path) -> Option<String> {
+    let path = socket_dir.join(".last");
+    let s = std::fs::read_to_string(path).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub fn session_connect_by_name(name: &str) -> Result<OwnedFd, String> {
     let prefix = socket::session_prefix();
     let session_name = socket::get_session_name(&prefix, name).map_err(|e| format!("{}", e))?;

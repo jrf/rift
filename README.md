@@ -32,6 +32,7 @@ rift write <session> <path>   Write stdin to a file via the session
 rift tail <name>...           Follow session output in real-time
 rift history <session>        Print session output (--vt, --html)
 rift logs <session> [...]     Tail -f the session log file (extra args pass to tail)
+rift last                     Attach to the most recently attached session
 rift detach [<session>]       Detach all clients (uses $RIFT_SESSION if no arg)
 rift rename [<old_name>] <new_name> Rename a session (defaults to $RIFT_SESSION)
 rift kill <name>... [-f]      Kill sessions (-f for SIGKILL)
@@ -39,7 +40,7 @@ rift wait <name>...           Wait for sessions to complete
 rift completions <shell>      Print completions (bash, zsh, fish)
 ```
 
-All subcommands have short aliases: `a`, `n`, `r`, `s`, `p`, `wr`, `t`, `hi`, `lg`, `d`, `rn`, `k`, `w`, `l`/`ls`, `c`, `v`, `h`.
+All subcommands have short aliases: `a`, `n`, `r`, `s`, `p`, `wr`, `t`, `hi`, `lg`, `la`, `d`, `rn`, `k`, `w`, `l`/`ls`, `c`, `v`, `h`.
 
 **Detach key:** `Ctrl+\`
 

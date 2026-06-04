@@ -745,6 +745,7 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
             }
             match socket::session_connect(&path_str) {
                 Ok(fd) => {
+                    util::write_last_session(&cfg.socket_dir, name);
                     return daemon::run_client(fd);
                 }
                 Err(_) => {
@@ -777,7 +778,24 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
         }
     };
 
+    util::write_last_session(&cfg.socket_dir, name);
     daemon::run_client(socket_fd)
+}
+
+// ---------------------------------------------------------------------------
+// last
+// ---------------------------------------------------------------------------
+
+pub fn cmd_last() -> i32 {
+    let socket_dir = socket::socket_dir();
+    let name = match util::read_last_session(&socket_dir) {
+        Some(n) => n,
+        None => {
+            eprintln!("error: no recent session");
+            return 1;
+        }
+    };
+    cmd_attach(&name, false, &[])
 }
 
 // ---------------------------------------------------------------------------

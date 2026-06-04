@@ -16,7 +16,7 @@ const BASH: &str = r#"_rift_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="attach new run send print write tail detach list completions kill history wait version help rename rn logs lg"
+  local commands="attach new run send print write tail detach list completions kill history wait version help rename rn logs lg last la"
 
   if [[ $COMP_CWORD -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -70,6 +70,7 @@ const ZSH: &str = r#"_rift() {
         'kill:Kill a session'
         'history:Print session output'
         'logs:Tail -f the session log file'
+        'last:Attach to the most recently attached session'
         'wait:Wait for sessions to complete'
         'version:Print version'
         'help:Print help'
@@ -124,6 +125,7 @@ complete -c rift -n "__fish_is_nth_token 1" -a 'c completions' -d 'Print shell c
 complete -c rift -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
 complete -c rift -n "__fish_is_nth_token 1" -a 'hi history' -d 'Print session output'
 complete -c rift -n "__fish_is_nth_token 1" -a 'lg logs' -d 'Tail -f the session log file'
+complete -c rift -n "__fish_is_nth_token 1" -a 'la last' -d 'Attach to the most recently attached session'
 complete -c rift -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for sessions to complete'
 complete -c rift -n "__fish_is_nth_token 1" -a 'v version' -d 'Print version'
 complete -c rift -s V -l version -d 'Print version'
