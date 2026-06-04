@@ -25,14 +25,18 @@ use super::ignore_signal;
 const MAX_OUT_BUF: usize = 4 * 1024 * 1024;
 
 /// "Be sane" reset sent on attach and detach: disable all common mouse-tracking
-/// variants, focus reporting, bracketed paste; exit alternate screen (1049 and
-/// the older 47); reset SGR; clear+home; show cursor; exit alternate keypad.
-/// DECSTR (`\e[!p`), cursor-position-report and scrolling-region reset were
-/// tried but triggered terminal status responses that got echoed back to the
-/// user's shell — keep this set minimal.
+/// variants, focus reporting, bracketed paste; pop one entry off the kitty
+/// keyboard-protocol stack (a program inside the session may have pushed
+/// kitty kbd mode and not popped it before we tore down, leaving subsequent
+/// Ctrl+<key> in the user's shell rendered as literal `N;5u` text); exit
+/// alternate screen (1049 and the older 47); reset SGR; clear+home; show
+/// cursor; exit alternate keypad. DECSTR (`\e[!p`), cursor-position-report
+/// and scrolling-region reset were tried but triggered terminal status
+/// responses that got echoed back to the user's shell — keep this set minimal.
 const TERMINAL_RESET: &[u8] = b"\
 \x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\
 \x1b[?2004l\
+\x1b[<u\
 \x1b[?1049l\x1b[?47l\
 \x1b[0m\
 \x1b[2J\x1b[H\
