@@ -20,6 +20,7 @@ cargo build       # direct cargo
 ## Usage
 
 ```
+rift                          Pick a session interactively ($RIFT_PICKER or builtin)
 rift <session>                Attach to (or create) a session
 rift attach <session>         Same as above
 rift attach -d <session>      Create session without attaching
@@ -78,6 +79,7 @@ rift list
 | `RIFT_DIR_MODE` | Permission mode for socket directory |
 | `RIFT_LOG_MODE` | Permission mode for log files |
 | `RIFT_EMPTY_TIMEOUT` | Idle duration (in seconds) after which a detached session with 0 clients will automatically terminate (e.g., `3600` for 1 hour) |
+| `RIFT_PICKER` | Shell command to use as session picker when `rift` is run with no args (e.g., `fzf`); receives session names on stdin, must print selection on stdout. Default: built-in numbered prompt. |
 
 ## SSH Agent Forwarding
 

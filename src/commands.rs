@@ -783,6 +783,121 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// pick (interactive picker — invoked by bare `rift` with no args)
+// ---------------------------------------------------------------------------
+
+pub fn cmd_pick() -> i32 {
+    let socket_dir = socket::socket_dir();
+    let entries = match util::get_session_entries(&socket_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+    if entries.is_empty() {
+        eprintln!("no sessions — `rift help` or `rift <name>` to create one");
+        return 0;
+    }
+    let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+
+    let picker_env = std::env::var("RIFT_PICKER").ok().filter(|s| !s.is_empty());
+    let picked = match picker_env {
+        Some(cmd) => run_external_picker(&cmd, &names),
+        None => run_builtin_picker(&names),
+    };
+    let full_name = match picked {
+        Some(n) => n,
+        None => return 0,
+    };
+
+    let prefix = socket::session_prefix();
+    let bare = full_name
+        .strip_prefix(&prefix)
+        .unwrap_or(&full_name)
+        .to_string();
+    cmd_attach(&bare, false, &[])
+}
+
+fn run_external_picker(picker_cmd: &str, names: &[String]) -> Option<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = match Command::new("sh")
+        .arg("-c")
+        .arg(picker_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to spawn picker: {}", e);
+            return None;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(names.join("\n").as_bytes());
+    }
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(_) => return None,
+    };
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    s.lines()
+        .next()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+}
+
+fn run_builtin_picker(names: &[String]) -> Option<String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut tty = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("error: no controlling tty");
+            return None;
+        }
+    };
+    for (i, name) in names.iter().enumerate() {
+        let _ = writeln!(tty, "{:3}  {}", i + 1, name);
+    }
+    let _ = write!(tty, "> ");
+    let _ = tty.flush();
+
+    let mut reader = BufReader::new(tty);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return None;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(n) = trimmed.parse::<usize>() {
+        if (1..=names.len()).contains(&n) {
+            return Some(names[n - 1].clone());
+        }
+        eprintln!("error: out of range");
+        return None;
+    }
+    if names.iter().any(|n| n == trimmed) {
+        return Some(trimmed.to_string());
+    }
+    eprintln!("error: no session matches '{}'", trimmed);
+    None
+}
+
+// ---------------------------------------------------------------------------
 // last
 // ---------------------------------------------------------------------------
 

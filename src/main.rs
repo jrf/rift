@@ -28,6 +28,7 @@ enum Command {
     Completions { shell: String },
     Logs { name: String, extra: Vec<String> },
     Last,
+    Pick,
     Version,
     Help,
 }
@@ -36,7 +37,7 @@ fn parse_args() -> Command {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.is_empty() {
-        return Command::Help;
+        return Command::Pick;
     }
 
     let first = args[0].as_str();
@@ -247,6 +248,7 @@ fn main() {
         Command::Completions { shell } => { completions::print_completions(&shell); 0 }
         Command::Logs { name, extra } => commands::cmd_logs(&name, &extra),
         Command::Last => commands::cmd_last(),
+        Command::Pick => commands::cmd_pick(),
         Command::Attach { name, detached, cmd } => commands::cmd_attach(&name, detached, &cmd),
     };
     std::process::exit(code);
@@ -258,6 +260,7 @@ fn print_help() {
 rift — terminal session daemon
 
 Usage:
+  rift                          Pick a session interactively ($RIFT_PICKER or builtin)
   rift <session>                Attach to (or create) a session
   rift attach|a <session>       Same as above (optional <cmd> to run instead of shell)
   rift attach -d <session>      Create session without attaching

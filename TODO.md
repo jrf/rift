@@ -9,6 +9,7 @@
 ## Scrapped
 
 ## Done
+- [x] Argless `rift` opens an interactive picker — uses `$RIFT_PICKER` (e.g., fzf) if set, otherwise a built-in numbered prompt on /dev/tty #feature
 - [x] `last` / `la` — re-attach to the most recently attached session (state file `<socket_dir>/.last`) #feature
 - [x] `logs` / `lg` — shortcut for `tail -f` on the session's log file, with extra args passed through to `tail` #feature
 - [x] Rename sessions — `rift rename [<old_name>] <new_name>` (alias `rn`) dynamically renames active sessions, including Unix sockets, logs, and symlinks #feature
