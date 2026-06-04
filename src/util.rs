@@ -328,6 +328,10 @@ pub fn read_last_session(socket_dir: &Path) -> Option<String> {
     }
 }
 
+pub fn clear_last_session(socket_dir: &Path) {
+    let _ = std::fs::remove_file(socket_dir.join(".last"));
+}
+
 pub fn session_connect_by_name(name: &str) -> Result<OwnedFd, String> {
     let prefix = socket::session_prefix();
     let session_name = socket::get_session_name(&prefix, name).map_err(|e| format!("{}", e))?;

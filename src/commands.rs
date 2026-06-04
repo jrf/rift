@@ -912,12 +912,18 @@ pub fn cmd_last() -> i32 {
     let socket_dir = socket::socket_dir();
     let name = match util::read_last_session(&socket_dir) {
         Some(n) => n,
-        None => {
-            eprintln!("error: no recent session");
-            return 1;
-        }
+        None => return cmd_pick(),
     };
-    cmd_attach(&name, false, &[])
+    let prefix = socket::session_prefix();
+    let full = format!("{}{}", prefix, name);
+    match socket::session_exists(&socket_dir, &full) {
+        Ok(true) => cmd_attach(&name, false, &[]),
+        _ => {
+            eprintln!("last session '{}' is gone", name);
+            util::clear_last_session(&socket_dir);
+            cmd_pick()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

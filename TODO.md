@@ -9,6 +9,7 @@
 ## Scrapped
 
 ## Done
+- [x] `rift last` self-heals — if the recorded session is gone, clear `.last` and fall back to the picker instead of erroring #improvement
 - [x] `list -v` / `--verbose` — adds uptime (derived from `created_at`) and log file path to each session line #improvement
 - [x] Lifecycle hooks — `RIFT_ON_ATTACH` / `RIFT_ON_DETACH` (client-side) and `RIFT_ON_EXIT` (daemon-side) fire-and-forget shell snippets with `$RIFT_SESSION` set #feature
 - [x] Argless `rift` opens an interactive picker — uses `$RIFT_PICKER` (e.g., fzf) if set, otherwise a built-in numbered prompt on /dev/tty #feature
