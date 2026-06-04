@@ -7,7 +7,7 @@ use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawF
 
 use bytes::Bytes;
 use nix::sys::signal::Signal;
-use nix::sys::termios::{self, SetArg, Termios};
+use nix::sys::termios::{self, FlushArg, SetArg, Termios};
 use nix::unistd;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
@@ -23,6 +23,21 @@ use super::ignore_signal;
 /// Client-side output buffer cap. Above this, drop oldest bytes rather than
 /// grow unbounded if stdout can't keep up.
 const MAX_OUT_BUF: usize = 4 * 1024 * 1024;
+
+/// "Be sane" reset sent on attach and detach: disable all common mouse-tracking
+/// variants, focus reporting, bracketed paste; exit alternate screen (1049 and
+/// the older 47); reset SGR; clear+home; show cursor; exit alternate keypad.
+/// DECSTR (`\e[!p`), cursor-position-report and scrolling-region reset were
+/// tried but triggered terminal status responses that got echoed back to the
+/// user's shell — keep this set minimal.
+const TERMINAL_RESET: &[u8] = b"\
+\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\
+\x1b[?2004l\
+\x1b[?1049l\x1b[?47l\
+\x1b[0m\
+\x1b[2J\x1b[H\
+\x1b[?25h\
+\x1b>";
 
 // ---------------------------------------------------------------------------
 // Terminal raw mode
@@ -96,6 +111,61 @@ impl AsRawFd for StdioFd {
 }
 
 // ---------------------------------------------------------------------------
+// AsyncFd try_io helpers
+// ---------------------------------------------------------------------------
+
+/// Outcome of a single non-blocking read or write via `AsyncFd::try_io`.
+enum IoStep {
+    /// Read or wrote `n > 0` bytes.
+    Bytes(usize),
+    /// The fd reported ready but the operation would have blocked. Caller
+    /// should re-await readiness (i.e. just continue the select loop).
+    WouldBlock,
+    /// EOF or unrecoverable error. Caller should stop.
+    Closed,
+}
+
+/// Wrap the readiness-guard + `try_io` + nix-error conversion + outcome-match
+/// pattern that otherwise repeats verbatim for every readable/writable branch.
+fn try_read<T: AsRawFd>(
+    ready: io::Result<tokio::io::unix::AsyncFdReadyGuard<'_, T>>,
+    buf: &mut [u8],
+) -> IoStep {
+    let mut guard = match ready {
+        Ok(g) => g,
+        Err(_) => return IoStep::Closed,
+    };
+    let res = guard.try_io(|inner| {
+        let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
+        unistd::read(&bfd, buf).map_err(|e| io::Error::from_raw_os_error(e as i32))
+    });
+    match res {
+        Ok(Ok(0)) | Ok(Err(_)) => IoStep::Closed,
+        Ok(Ok(n)) => IoStep::Bytes(n),
+        Err(_) => IoStep::WouldBlock,
+    }
+}
+
+fn try_write<T: AsRawFd>(
+    ready: io::Result<tokio::io::unix::AsyncFdReadyGuard<'_, T>>,
+    buf: &[u8],
+) -> IoStep {
+    let mut guard = match ready {
+        Ok(g) => g,
+        Err(_) => return IoStep::Closed,
+    };
+    let res = guard.try_io(|inner| {
+        let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
+        unistd::write(&bfd, buf).map_err(|e| io::Error::from_raw_os_error(e as i32))
+    });
+    match res {
+        Ok(Ok(0)) | Ok(Err(_)) => IoStep::Closed,
+        Ok(Ok(n)) => IoStep::Bytes(n),
+        Err(_) => IoStep::WouldBlock,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Client entry point
 // ---------------------------------------------------------------------------
 
@@ -104,17 +174,15 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     let stdin_fd: RawFd = 0;
     let stdout_fd: RawFd = 1;
 
-    if let Err(e) = socket::set_nonblock_and_cloexec(socket_fd) {
-        eprintln!("error: failed to set socket nonblock: {}", e);
-        return 1;
-    }
-    if let Err(e) = socket::set_nonblock_and_cloexec(stdout_fd) {
-        eprintln!("error: failed to set stdout nonblock: {}", e);
-        return 1;
-    }
-    if let Err(e) = socket::set_nonblock_and_cloexec(stdin_fd) {
-        eprintln!("error: failed to set stdin nonblock: {}", e);
-        return 1;
+    for (fd, name) in [
+        (socket_fd, "socket"),
+        (stdout_fd, "stdout"),
+        (stdin_fd, "stdin"),
+    ] {
+        if let Err(e) = socket::set_nonblock_and_cloexec(fd) {
+            eprintln!("error: failed to set {} nonblock: {}", name, e);
+            return 1;
+        }
     }
     let _stdout_guard = NonBlockGuard { fd: stdout_fd };
     let _stdin_guard = NonBlockGuard { fd: stdin_fd };
@@ -174,6 +242,14 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     // Send the standard "be sane" set before we restore termios so the
     // user's shell isn't stuck reporting mouse coords / hidden cursor.
     write_terminal_reset(stdout_fd);
+
+    // Discard any bytes the terminal had queued on stdin at detach time —
+    // typically trailing mouse coords, focus reports, or kitty kbd events
+    // that the session had enabled but never got consumed by the select
+    // loop. Without this they survive the TCSANOW restore below and land
+    // as visible junk in the next program's stdin.
+    let stdin_bfd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
+    let _ = termios::tcflush(&stdin_bfd, FlushArg::TCIFLUSH);
     0
 }
 
@@ -238,18 +314,8 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
             }
 
             ready = stdin_async.readable() => {
-                let mut guard = match ready {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-                let res = guard.try_io(|inner| {
-                    let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
-                    unistd::read(&bfd, &mut stdin_buf)
-                        .map_err(|e| io::Error::from_raw_os_error(e as i32))
-                });
-                match res {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
+                match try_read(ready, &mut stdin_buf) {
+                    IoStep::Bytes(n) => {
                         let data = &stdin_buf[..n];
                         if data.contains(&0x1c) || util::is_kitty_ctrl_backslash(data) {
                             let _ = writer.send((Tag::Detach, Bytes::new())).await;
@@ -259,8 +325,8 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
                             .send((Tag::Input, Bytes::copy_from_slice(data)))
                             .await;
                     }
-                    Ok(Err(_)) => break,
-                    Err(_would_block) => {}
+                    IoStep::Closed => break,
+                    IoStep::WouldBlock => {}
                 }
             }
 
@@ -283,22 +349,10 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
             }
 
             ready = stdout_async.writable(), if has_pending => {
-                let mut guard = match ready {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-                let res = guard.try_io(|inner| {
-                    let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
-                    unistd::write(&bfd, &out_buf)
-                        .map_err(|e| io::Error::from_raw_os_error(e as i32))
-                });
-                match res {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
-                        out_buf.drain(..n);
-                    }
-                    Ok(Err(_)) => break,
-                    Err(_would_block) => {}
+                match try_write(ready, &out_buf) {
+                    IoStep::Bytes(n) => { out_buf.drain(..n); }
+                    IoStep::Closed => break,
+                    IoStep::WouldBlock => {}
                 }
             }
         }
@@ -306,6 +360,9 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
 
     // Final synchronous drain so any tail bytes reach the terminal before
     // the runtime tears down (and write_terminal_reset writes over them).
+    // Stdout is still O_NONBLOCK here; on EAGAIN we briefly back off and
+    // retry rather than break — silently dropping the tail can chop an
+    // escape sequence and leave its remainder visible as literal text.
     let bfd = unsafe { BorrowedFd::borrow_raw(stdout_fd) };
     while !out_buf.is_empty() {
         match unistd::write(&bfd, &out_buf) {
@@ -313,30 +370,19 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
                 out_buf.drain(..n);
             }
             Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EAGAIN) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             _ => break,
         }
     }
 }
 
 fn write_terminal_reset(fd: RawFd) {
-    // Restore a sane terminal on detach: disable all common mouse-tracking
-    // variants, focus reporting, bracketed paste; exit alternate screen
-    // (both 1049 and the older 47); reset SGR; show the cursor; exit
-    // alternate keypad. DECSTR (`\e[!p`), cursor-home and scrolling-region
-    // reset were tried but triggered terminal status responses that got
-    // echoed back to the user's shell — keep this set minimal.
-    const RESET: &[u8] = b"\
-\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\
-\x1b[?2004l\
-\x1b[?1049l\x1b[?47l\
-\x1b[0m\
-\x1b[2J\x1b[H\
-\x1b[?25h\
-\x1b>";
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
     let mut written = 0;
-    while written < RESET.len() {
-        match unistd::write(&bfd, &RESET[written..]) {
+    while written < TERMINAL_RESET.len() {
+        match unistd::write(&bfd, &TERMINAL_RESET[written..]) {
             Ok(n) if n > 0 => written += n,
             Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => continue,
             _ => break,

@@ -202,6 +202,7 @@ struct DaemonState {
     child_exited: bool,
     has_had_client: bool,
     clients: HashMap<u64, mpsc::Sender<DaemonFrame>>,
+    next_client_id: u64,
     last_client_disconnected_at: Option<u64>,
     empty_timeout: Option<u64>,
     old_session_names: Vec<String>,
@@ -275,6 +276,104 @@ impl DaemonState {
             payload: Bytes::copy_from_slice(data),
         });
         self.clients.is_empty()
+    }
+
+    /// Register a newly-accepted client: allocate an id, set up the per-task
+    /// mpsc channel, build the optional Init replay (only for second-and-on
+    /// attaches — first attach gets live output from the freshly-spawned
+    /// shell), then spawn the per-client task.
+    fn accept_client(
+        &mut self,
+        stream: UnixStream,
+        daemon_tx: mpsc::UnboundedSender<(u64, ClientMsg)>,
+    ) {
+        let id = self.next_client_id;
+        self.next_client_id += 1;
+        let (tx, rx) = mpsc::channel(CLIENT_TX_BUF);
+
+        let initial = if self.has_had_client {
+            util::serialize_terminal_state(&self.parser).map(|s| DaemonFrame {
+                tag: Tag::Init,
+                payload: Bytes::from(s),
+            })
+        } else {
+            None
+        };
+        self.has_had_client = true;
+        self.clients.insert(id, tx);
+        log::info!("client connected, id={}", id);
+
+        tokio::task::spawn_local(async move {
+            client_task(stream, id, initial, rx, daemon_tx).await;
+        });
+    }
+
+    /// Rename the live session: move its socket, SSH-auth-sock symlink, and
+    /// log files to the new name, then re-init the logger. The old name is
+    /// remembered so the symlink that points at the new name can be cleaned
+    /// up on exit (existing clients reach the daemon via the old symlink
+    /// pointing at the new one). No-op if `new_name` matches the current
+    /// name or if the target socket path is already occupied.
+    fn rename_session(&mut self, new_name: &str) {
+        if new_name == self.session_name {
+            return;
+        }
+        let old_socket_path = self.socket_dir.join(&self.session_name);
+        let new_socket_path = self.socket_dir.join(new_name);
+
+        if new_socket_path.exists() {
+            log::error!(
+                "rename failed: target socket path already exists: {}",
+                new_socket_path.display()
+            );
+            return;
+        }
+        if let Err(e) = std::fs::rename(&old_socket_path, &new_socket_path) {
+            log::error!("rename failed: failed to rename socket: {}", e);
+            return;
+        }
+        log::info!(
+            "session renamed: '{}' -> '{}'",
+            self.session_name,
+            new_name
+        );
+
+        // SSH-auth-sock: repoint the new-name symlink at the same target the
+        // old one had, then make the old name a symlink to the new one so
+        // already-attached clients keep resolving correctly.
+        let old_symlink = self
+            .socket_dir
+            .join(format!("{}.ssh-auth-sock", self.session_name));
+        let new_symlink = self.socket_dir.join(format!("{}.ssh-auth-sock", new_name));
+        if let Ok(target) = std::fs::read_link(&old_symlink) {
+            if new_symlink.exists() || new_symlink.is_symlink() {
+                let _ = std::fs::remove_file(&new_symlink);
+            }
+            let _ = std::os::unix::fs::symlink(&target, &new_symlink);
+            let _ = std::fs::remove_file(&old_symlink);
+            let _ = std::os::unix::fs::symlink(&new_symlink, &old_symlink);
+        }
+
+        // Logs: rename current + rotated, then re-init the logger to point at
+        // the new path. Failures are non-fatal — logging just stops working
+        // and the user sees an error in stderr / current log.
+        let logs_dir = self.socket_dir.join("logs");
+        let old_log = logs_dir.join(format!("{}.log", self.session_name));
+        let new_log = logs_dir.join(format!("{}.log", new_name));
+        let old_log_rotated = logs_dir.join(format!("{}.log.old", self.session_name));
+        let new_log_rotated = logs_dir.join(format!("{}.log.old", new_name));
+        if old_log.exists() {
+            let _ = std::fs::rename(&old_log, &new_log);
+        }
+        if old_log_rotated.exists() {
+            let _ = std::fs::rename(&old_log_rotated, &new_log_rotated);
+        }
+        if let Err(e) = self.log_system.init(&new_log) {
+            log::error!("failed to re-init log at {}: {}", new_log.display(), e);
+        }
+
+        self.old_session_names.push(self.session_name.clone());
+        self.session_name = new_name.to_string();
     }
 
     /// Dispatch a parsed protocol frame from client `id`.
@@ -377,95 +476,9 @@ impl DaemonState {
                 }
             }
             Tag::Rename => {
-                if !payload.is_empty() {
-                    if let Ok(new_name_str) = std::str::from_utf8(&payload) {
-                        let new_name = new_name_str.to_string();
-                        if new_name != self.session_name {
-                            let old_socket_path = self.socket_dir.join(&self.session_name);
-                            let new_socket_path = self.socket_dir.join(&new_name);
-
-                            if new_socket_path.exists() {
-                                log::error!(
-                                    "rename failed: target socket path already exists: {}",
-                                    new_socket_path.display()
-                                );
-                            } else {
-                                match std::fs::rename(&old_socket_path, &new_socket_path) {
-                                    Ok(()) => {
-                                        log::info!(
-                                            "session renamed: '{}' -> '{}'",
-                                            self.session_name,
-                                            new_name
-                                        );
-
-                                        // Update SSH auth sock symlink
-                                        let old_symlink = self.socket_dir.join(format!(
-                                            "{}.ssh-auth-sock",
-                                            self.session_name
-                                        ));
-                                        let new_symlink = self.socket_dir.join(format!(
-                                            "{}.ssh-auth-sock",
-                                            new_name
-                                        ));
-                                        if let Ok(target) = std::fs::read_link(&old_symlink) {
-                                            if new_symlink.exists() || new_symlink.is_symlink() {
-                                                let _ = std::fs::remove_file(&new_symlink);
-                                            }
-                                            let _ = std::os::unix::fs::symlink(&target, &new_symlink);
-
-                                            // Recreate old symlink to point to new symlink
-                                            let _ = std::fs::remove_file(&old_symlink);
-                                            let _ = std::os::unix::fs::symlink(&new_symlink, &old_symlink);
-                                        }
-
-                                        // Update logging path
-                                        let old_log_path = self
-                                            .socket_dir
-                                            .join("logs")
-                                            .join(format!("{}.log", self.session_name));
-                                        let new_log_path = self
-                                            .socket_dir
-                                            .join("logs")
-                                            .join(format!("{}.log", new_name));
-                                        let old_log_old_path = self
-                                            .socket_dir
-                                            .join("logs")
-                                            .join(format!("{}.log.old", self.session_name));
-                                        let new_log_old_path = self
-                                            .socket_dir
-                                            .join("logs")
-                                            .join(format!("{}.log.old", new_name));
-
-                                        if old_log_path.exists() {
-                                            let _ = std::fs::rename(&old_log_path, &new_log_path);
-                                        }
-                                        if old_log_old_path.exists() {
-                                            let _ = std::fs::rename(&old_log_old_path, &new_log_old_path);
-                                        }
-
-                                        if let Err(e) = self.log_system.init(&new_log_path) {
-                                            log::error!(
-                                                "failed to re-init log at {}: {}",
-                                                new_log_path.display(),
-                                                e
-                                            );
-                                        }
-
-                                        // Store the old session name for cleanup on exit
-                                        self.old_session_names.push(self.session_name.clone());
-
-                                        // Update active session name
-                                        self.session_name = new_name;
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "rename failed: failed to rename socket: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                if let Ok(new_name) = std::str::from_utf8(&payload) {
+                    if !new_name.is_empty() {
+                        self.rename_session(new_name);
                     }
                 }
             }
@@ -556,7 +569,6 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
     };
 
     let (daemon_tx, mut daemon_rx) = mpsc::unbounded_channel::<(u64, ClientMsg)>();
-    let mut next_client_id: u64 = 0;
     let mut pty_buf = vec![0u8; PTY_READ_BUF];
 
     loop {
@@ -642,31 +654,8 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
 
             accept = listener.accept() => {
                 match accept {
-                    Ok((stream, _addr)) => {
-                        let id = next_client_id;
-                        next_client_id += 1;
-                        let (tx, rx) = mpsc::channel(CLIENT_TX_BUF);
-
-                        let initial = if state.has_had_client {
-                            util::serialize_terminal_state(&state.parser).map(|s| DaemonFrame {
-                                tag: Tag::Init,
-                                payload: Bytes::from(s),
-                            })
-                        } else {
-                            None
-                        };
-                        state.has_had_client = true;
-                        state.clients.insert(id, tx);
-                        log::info!("client connected, id={}", id);
-
-                        let dtx = daemon_tx.clone();
-                        tokio::task::spawn_local(async move {
-                            client_task(stream, id, initial, rx, dtx).await;
-                        });
-                    }
-                    Err(e) => {
-                        log::warn!("accept error: {}", e);
-                    }
+                    Ok((stream, _addr)) => state.accept_client(stream, daemon_tx.clone()),
+                    Err(e) => log::warn!("accept error: {}", e),
                 }
             }
 
@@ -806,6 +795,7 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
         child_exited: false,
         has_had_client: false,
         clients: HashMap::new(),
+        next_client_id: 0,
         last_client_disconnected_at: None,
         empty_timeout,
         old_session_names: Vec::new(),
