@@ -21,14 +21,18 @@ if command -v rift >/dev/null 2>&1; then
         rift list -s
     }
 
-    # Internal helper to pick a session with fzf
+    # Internal helper to pick a session with fzf. Sub-sessions (names containing
+    # a dot) are grouped under their base by sorting, and indented for clarity.
     __rift_pick() {
         local sessions
         sessions=$(__rift_sessions 2>/dev/null)
         if [ -z "$sessions" ]; then
             return 1
         fi
-        echo "$sessions" | fzf --prompt="rift > " --height=40% --reverse
+        local picked
+        picked=$(echo "$sessions" | sort | sed 's/^.*\..*/  &/' \
+            | fzf --prompt="rift > " --height=40% --reverse)
+        echo "${picked#  }"
     }
 
     # ra: cd to a session's start directory and attach (defaults to project name)
