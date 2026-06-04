@@ -667,6 +667,45 @@ pub fn cmd_tail(names: &[String]) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// logs
+// ---------------------------------------------------------------------------
+
+pub fn cmd_logs(name: &str, extra_args: &[String]) -> i32 {
+    let prefix = socket::session_prefix();
+    let session_name = match socket::get_session_name(&prefix, name) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+    let log_path = socket::socket_dir()
+        .join("logs")
+        .join(format!("{}.log", session_name));
+    if !log_path.exists() {
+        eprintln!(
+            "error: no log file for session '{}' at {}",
+            name,
+            log_path.display()
+        );
+        return 1;
+    }
+    let mut tail_args: Vec<String> = if extra_args.is_empty() {
+        vec!["-f".to_string()]
+    } else {
+        extra_args.to_vec()
+    };
+    tail_args.push(log_path.to_string_lossy().into_owned());
+    match std::process::Command::new("tail").args(&tail_args).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("error: failed to exec tail: {}", e);
+            1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // attach
 // ---------------------------------------------------------------------------
 
