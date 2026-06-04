@@ -717,6 +717,8 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
         let old_symlink = state.socket_dir.join(format!("{}.ssh-auth-sock", old_name));
         let _ = std::fs::remove_file(old_symlink);
     }
+
+    util::run_hook("RIFT_ON_EXIT", &state.session_name);
 }
 
 // ---------------------------------------------------------------------------

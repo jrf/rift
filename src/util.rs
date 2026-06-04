@@ -248,6 +248,32 @@ pub fn pattern_matches(patterns: &[String], name: &str) -> bool {
     })
 }
 
+// -- Lifecycle hooks ----------------------------------------------------------
+//
+// Users can set `RIFT_ON_ATTACH`, `RIFT_ON_DETACH`, `RIFT_ON_EXIT` to shell
+// snippets that fire on the corresponding event. The snippet runs via `sh -c`
+// with `$RIFT_SESSION` set and the session name also passed as `$1`. The hook
+// is fire-and-forget (stdio is detached); users redirect inside the snippet
+// if they want output. The daemon-side EXIT hook inherits the env that was
+// present when the daemon was spawned by the first client.
+
+pub fn run_hook(env_var: &str, session_name: &str) {
+    let cmd = match std::env::var(env_var) {
+        Ok(c) if !c.is_empty() => c,
+        _ => return,
+    };
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .arg("rift-hook")
+        .arg(session_name)
+        .env("RIFT_SESSION", session_name)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 // -- Last-session state file --------------------------------------------------
 //
 // We record the bare (pre-prefix) session name of the most recent successful

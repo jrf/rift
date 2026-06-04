@@ -746,7 +746,10 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
             match socket::session_connect(&path_str) {
                 Ok(fd) => {
                     util::write_last_session(&cfg.socket_dir, name);
-                    return daemon::run_client(fd);
+                    util::run_hook("RIFT_ON_ATTACH", &cfg.session_name);
+                    let code = daemon::run_client(fd);
+                    util::run_hook("RIFT_ON_DETACH", &cfg.session_name);
+                    return code;
                 }
                 Err(_) => {
                     socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
@@ -779,7 +782,10 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
     };
 
     util::write_last_session(&cfg.socket_dir, name);
-    daemon::run_client(socket_fd)
+    util::run_hook("RIFT_ON_ATTACH", &cfg.session_name);
+    let code = daemon::run_client(socket_fd);
+    util::run_hook("RIFT_ON_DETACH", &cfg.session_name);
+    code
 }
 
 // ---------------------------------------------------------------------------

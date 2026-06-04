@@ -80,6 +80,9 @@ rift list
 | `RIFT_LOG_MODE` | Permission mode for log files |
 | `RIFT_EMPTY_TIMEOUT` | Idle duration (in seconds) after which a detached session with 0 clients will automatically terminate (e.g., `3600` for 1 hour) |
 | `RIFT_PICKER` | Shell command to use as session picker when `rift` is run with no args (e.g., `fzf`); receives session names on stdin, must print selection on stdout. Default: built-in numbered prompt. |
+| `RIFT_ON_ATTACH` | Shell snippet run when a client attaches (fire-and-forget, stdio detached). `$RIFT_SESSION` is set and the session name is also passed as `$1`. |
+| `RIFT_ON_DETACH` | Shell snippet run when a client detaches. Same context as `RIFT_ON_ATTACH`. |
+| `RIFT_ON_EXIT` | Shell snippet run when the session's shell exits and the daemon tears down. Inherits the env present when the daemon was first spawned. |
 
 ## SSH Agent Forwarding
 
