@@ -149,6 +149,8 @@ pub fn write_session_line(
     w: &mut dyn Write,
     session: &SessionEntry,
     short: bool,
+    verbose: bool,
+    socket_dir: &Path,
     current_session: Option<&str>,
 ) -> io::Result<()> {
     let prefix = match current_session {
@@ -201,7 +203,38 @@ pub fn write_session_line(
             }
         }
     }
+    if verbose {
+        if session.created_at > 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now >= session.created_at {
+                write!(w, "\tuptime={}", format_duration(now - session.created_at))?;
+            }
+        }
+        let log_path = socket_dir
+            .join("logs")
+            .join(format!("{}.log", session.name));
+        write!(w, "\tlog={}", log_path.display())?;
+    }
     writeln!(w)
+}
+
+fn format_duration(secs: u64) -> String {
+    let d = secs / 86400;
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if d > 0 {
+        format!("{}d{}h", d, h)
+    } else if h > 0 {
+        format!("{}h{}m", h, m)
+    } else if m > 0 {
+        format!("{}m{}s", m, s)
+    } else {
+        format!("{}s", s)
+    }
 }
 
 // -- Session resolution helpers -----------------------------------------------

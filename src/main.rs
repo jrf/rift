@@ -14,7 +14,7 @@ use crate::util::HistoryFormat;
 
 enum Command {
     Attach { name: String, detached: bool, cmd: Vec<String> },
-    List { short: bool },
+    List { short: bool, verbose: bool },
     Run { name: String, cmd: Vec<String>, detached: bool, fish: bool },
     Send { name: String, text: Vec<String> },
     Tail { names: Vec<String> },
@@ -46,7 +46,8 @@ fn parse_args() -> Command {
         "--version" | "-V" | "version" | "v" => Command::Version,
         "list" | "ls" | "l" => {
             let short = args.iter().any(|a| a == "-s" || a == "--short");
-            Command::List { short }
+            let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
+            Command::List { short, verbose }
         }
         "kill" | "k" => {
             if args.len() < 2 {
@@ -234,7 +235,7 @@ fn main() {
     let code = match cmd {
         Command::Help => { print_help(); 0 }
         Command::Version => { println!("rift {}", env!("CARGO_PKG_VERSION")); 0 }
-        Command::List { short } => commands::cmd_list(short),
+        Command::List { short, verbose } => commands::cmd_list(short, verbose),
         Command::Kill { names, force } => commands::cmd_kill(&names, force),
         Command::Detach { name } => commands::cmd_detach(&name),
         Command::Run { name, cmd, detached, fish } => commands::cmd_run(&name, &cmd, detached, fish),
@@ -265,7 +266,7 @@ Usage:
   rift attach|a <session>       Same as above (optional <cmd> to run instead of shell)
   rift attach -d <session>      Create session without attaching
   rift new|n <session>          Same as attach -d
-  rift list|ls|l [-s]           List sessions (-s for short format)
+  rift list|ls|l [-s|-v]        List sessions (-s short, -v verbose: uptime + log path)
   rift run|r <session> <cmd...> Run a command in a session (-d, --fish)
   rift send|s <session> <text>  Send keystrokes to a session
   rift print|p <session> <text> Inject text into session display

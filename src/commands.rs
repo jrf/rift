@@ -14,7 +14,7 @@ use crate::util;
 // list
 // ---------------------------------------------------------------------------
 
-pub fn cmd_list(short: bool) -> i32 {
+pub fn cmd_list(short: bool, verbose: bool) -> i32 {
     let socket_dir = socket::socket_dir();
     let current = socket::session_name_from_env();
     let current_ref = if current.is_empty() {
@@ -28,7 +28,14 @@ pub fn cmd_list(short: bool) -> i32 {
             let stdout = io::stdout();
             let mut out = stdout.lock();
             for entry in &entries {
-                let _ = util::write_session_line(&mut out, entry, short, current_ref);
+                let _ = util::write_session_line(
+                    &mut out,
+                    entry,
+                    short,
+                    verbose,
+                    &socket_dir,
+                    current_ref,
+                );
             }
             0
         }

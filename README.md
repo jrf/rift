@@ -25,7 +25,7 @@ rift <session>                Attach to (or create) a session
 rift attach <session>         Same as above
 rift attach -d <session>      Create session without attaching
 rift new <session>            Same as attach -d
-rift list [-s]                List sessions (-s for short/scriptable format)
+rift list [-s|-v]             List sessions (-s short/scriptable, -v verbose: uptime + log path)
 rift run <session> <cmd...>   Run a command in a session (-d for detached, --fish)
 rift send <session> <text>    Send keystrokes to a session
 rift print <session> <text>   Inject text into session display

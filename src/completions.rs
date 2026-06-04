@@ -32,7 +32,7 @@ const BASH: &str = r#"_rift_completions() {
       COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
       ;;
     list|ls)
-      COMPREPLY=($(compgen -W "--short" -- "$cur"))
+      COMPREPLY=($(compgen -W "--short --verbose" -- "$cur"))
       ;;
     *)
       ;;
@@ -86,7 +86,7 @@ const ZSH: &str = r#"_rift() {
           _values 'shell' 'bash' 'zsh' 'fish'
           ;;
         list|ls)
-          _values 'options' '--short'
+          _values 'options' '--short' '--verbose'
           ;;
       esac
       ;;
@@ -137,6 +137,7 @@ complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from atta
 complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish' -d Shell
 
 complete -c rift -n "__fish_seen_subcommand_from list ls l" -l short -s s -d 'Short output'
+complete -c rift -n "__fish_seen_subcommand_from list ls l" -l verbose -s v -d 'Verbose output (uptime, log path)'
 complete -c rift -n "__fish_seen_subcommand_from history hi" -l vt -d 'VT escape sequence format'
 complete -c rift -n "__fish_seen_subcommand_from history hi" -l html -d 'HTML format'
 complete -c rift -n "__fish_seen_subcommand_from attach a" -s d -l detached -d 'Create without attaching'
