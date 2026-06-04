@@ -140,7 +140,7 @@ fn parse_args() -> Command {
                     _ => {}
                 }
             }
-            let name = session_name.unwrap_or_else(|| socket::session_name_from_env());
+            let name = session_name.unwrap_or_else(socket::session_name_from_env);
             if name.is_empty() {
                 eprintln!("error: history requires a session name");
                 std::process::exit(1);

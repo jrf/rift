@@ -175,7 +175,7 @@ pub fn write_all(fd: RawFd, data: &[u8]) -> io::Result<()> {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
     let mut offset = 0;
     while offset < data.len() {
-        match unistd::write(&bfd, &data[offset..]) {
+        match unistd::write(bfd, &data[offset..]) {
             Ok(n) => {
                 if n == 0 {
                     return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"));
@@ -217,7 +217,7 @@ impl SocketBuffer {
 
         let mut tmp = [0u8; 4096];
         let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
-        let n = unistd::read(&bfd, &mut tmp)?;
+        let n = unistd::read(bfd, &mut tmp)?;
         if n > 0 {
             self.buf.extend_from_slice(&tmp[..n]);
         }
@@ -306,11 +306,10 @@ pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
         }
 
         while let Some((tag, payload)) = sb.next() {
-            if tag == Tag::Info {
-                if let Some(info) = Info::decode(payload) {
+            if tag == Tag::Info
+                && let Some(info) = Info::decode(payload) {
                     return Ok(ProbeResult { fd, info });
                 }
-            }
         }
     }
 }

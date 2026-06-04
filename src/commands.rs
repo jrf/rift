@@ -287,11 +287,10 @@ pub fn cmd_wait(names: &[String]) -> i32 {
 
             match session.task_ended_at {
                 Some(t) if t > 0 => {
-                    if let Some(code) = session.task_exit_code {
-                        if code != 0 {
+                    if let Some(code) = session.task_exit_code
+                        && code != 0 {
                             last_exit_code = code as i32;
                         }
-                    }
                 }
                 _ => {
                     eprintln!("still waiting task={}", session.name);
@@ -416,11 +415,8 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
             Ok(0) => break,
             Ok(_) => {
                 while let Some((tag, payload)) = socket_buf.next() {
-                    match tag {
-                        Tag::Output => {
-                            let _ = ipc::write_all(stdout_fd, payload);
-                        }
-                        _ => {}
+                    if tag == Tag::Output {
+                        let _ = ipc::write_all(stdout_fd, payload);
                     }
                 }
             }
@@ -620,17 +616,15 @@ pub fn cmd_tail(names: &[String]) -> i32 {
             Err(_) => break,
         }
 
-        if let Some(revents) = poll_fds[0].revents() {
-            if revents.contains(PollFlags::POLLIN) {
+        if let Some(revents) = poll_fds[0].revents()
+            && revents.contains(PollFlags::POLLIN) {
                 let mut buf = [0u8; 128];
                 let stdin_bfd = unsafe { BorrowedFd::borrow_raw(0) };
-                if let Ok(n) = nix::unistd::read(&stdin_bfd, &mut buf) {
-                    if n > 0 && buf[..n].contains(&0x03) {
+                if let Ok(n) = nix::unistd::read(stdin_bfd, &mut buf)
+                    && n > 0 && buf[..n].contains(&0x03) {
                         return 0;
                     }
-                }
             }
-        }
 
         let mut closed = Vec::new();
         for i in 0..fds.len() {

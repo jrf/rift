@@ -75,11 +75,10 @@ impl LogSystem {
         let line = format!("[{}] [{}] ({}): {}\n", now, level, target, message);
         let len = line.len() as u64;
 
-        if let Some(ref mut f) = inner.file {
-            if f.write_all(line.as_bytes()).is_ok() {
+        if let Some(ref mut f) = inner.file
+            && f.write_all(line.as_bytes()).is_ok() {
                 inner.current_size += len;
             }
-        }
     }
 }
 

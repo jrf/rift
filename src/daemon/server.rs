@@ -38,12 +38,12 @@ const PTY_READ_BUF: usize = 4096;
 
 fn read_raw(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
-    unistd::read(&bfd, buf)
+    unistd::read(bfd, buf)
 }
 
 fn redirect_std_to_devnull() {
     unsafe {
-        let devnull = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
         if devnull >= 0 {
             libc::dup2(devnull, 0);
             libc::dup2(devnull, 1);
@@ -450,37 +450,33 @@ impl DaemonState {
                     },
                 );
             }
-            Tag::Print => {
-                if !payload.is_empty() {
+            Tag::Print
+                if !payload.is_empty() => {
                     self.parser.process(&payload);
                     self.broadcast(DaemonFrame {
                         tag: Tag::Output,
                         payload: Bytes::copy_from_slice(&payload),
                     });
                 }
-            }
-            Tag::Run => {
-                if !payload.is_empty() {
+            Tag::Run
+                if !payload.is_empty() => {
                     let _ = ipc::write_all(self.pty_master_fd, &payload);
                 }
-            }
             Tag::SshAuthSock => {
-                if !payload.is_empty() {
-                    if let Ok(path) = std::str::from_utf8(&payload) {
+                if !payload.is_empty()
+                    && let Ok(path) = std::str::from_utf8(&payload) {
                         socket::update_ssh_auth_sock_symlink(
                             &self.socket_dir,
                             &self.session_name,
                             path,
                         );
                     }
-                }
             }
             Tag::Rename => {
-                if let Ok(new_name) = std::str::from_utf8(&payload) {
-                    if !new_name.is_empty() {
+                if let Ok(new_name) = std::str::from_utf8(&payload)
+                    && !new_name.is_empty() {
                         self.rename_session(new_name);
                     }
-                }
             }
             _ => {}
         }
@@ -509,11 +505,10 @@ async fn client_task(
     let mut writer = FramedWrite::new(write_half, RiftCodec);
 
     let write_join = tokio::task::spawn_local(async move {
-        if let Some(initial) = initial {
-            if writer.send((initial.tag, initial.payload)).await.is_err() {
+        if let Some(initial) = initial
+            && writer.send((initial.tag, initial.payload)).await.is_err() {
                 return;
             }
-        }
         while let Some(frame) = rx.recv().await {
             if writer.send((frame.tag, frame.payload)).await.is_err() {
                 break;
@@ -615,7 +610,7 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
                     Ok(mut guard) => {
                         let res = guard.try_io(|inner| {
                             let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
-                            unistd::read(&bfd, &mut pty_buf)
+                            unistd::read(bfd, &mut pty_buf)
                                 .map_err(|e| io::Error::from_raw_os_error(e as i32))
                         });
                         match res {
@@ -688,11 +683,10 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
             // Drain a final non-blocking read so any trailing output reaches
             // attached clients before we tear down.
             let bfd = unsafe { BorrowedFd::borrow_raw(state.pty_master_fd) };
-            if let Ok(n) = unistd::read(&bfd, &mut pty_buf) {
-                if n > 0 {
+            if let Ok(n) = unistd::read(bfd, &mut pty_buf)
+                && n > 0 {
                     state.on_pty_bytes(&pty_buf[..n]);
                 }
-            }
             break;
         }
     }

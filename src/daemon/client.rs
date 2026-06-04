@@ -49,11 +49,11 @@ const TERMINAL_RESET: &[u8] = b"\
 
 fn enter_raw_mode(fd: RawFd) -> io::Result<Termios> {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let saved = termios::tcgetattr(&bfd).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    let saved = termios::tcgetattr(bfd).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     let mut raw = saved.clone();
     termios::cfmakeraw(&mut raw);
     raw.control_chars[nix::sys::termios::SpecialCharacterIndices::VQUIT as usize] = 0;
-    termios::tcsetattr(&bfd, SetArg::TCSAFLUSH, &raw)
+    termios::tcsetattr(bfd, SetArg::TCSAFLUSH, &raw)
         .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     Ok(saved)
 }
@@ -81,7 +81,7 @@ impl Drop for RawModeGuard {
             | LocalFlags::ISIG
             | LocalFlags::IEXTEN;
         restored.input_flags |= InputFlags::ICRNL | InputFlags::BRKINT;
-        let _ = termios::tcsetattr(&bfd, SetArg::TCSANOW, &restored);
+        let _ = termios::tcsetattr(bfd, SetArg::TCSANOW, &restored);
     }
 }
 
@@ -93,9 +93,9 @@ impl Drop for NonBlockGuard {
     fn drop(&mut self) {
         use nix::fcntl::{fcntl, FcntlArg, OFlag};
         let bfd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        if let Ok(fl) = fcntl(&bfd, FcntlArg::F_GETFL) {
+        if let Ok(fl) = fcntl(bfd, FcntlArg::F_GETFL) {
             let fl = OFlag::from_bits_truncate(fl) & !OFlag::O_NONBLOCK;
-            let _ = fcntl(&bfd, FcntlArg::F_SETFL(fl));
+            let _ = fcntl(bfd, FcntlArg::F_SETFL(fl));
         }
     }
 }
@@ -141,7 +141,7 @@ fn try_read<T: AsRawFd>(
     };
     let res = guard.try_io(|inner| {
         let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
-        unistd::read(&bfd, buf).map_err(|e| io::Error::from_raw_os_error(e as i32))
+        unistd::read(bfd, buf).map_err(|e| io::Error::from_raw_os_error(e as i32))
     });
     match res {
         Ok(Ok(0)) | Ok(Err(_)) => IoStep::Closed,
@@ -160,7 +160,7 @@ fn try_write<T: AsRawFd>(
     };
     let res = guard.try_io(|inner| {
         let bfd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
-        unistd::write(&bfd, buf).map_err(|e| io::Error::from_raw_os_error(e as i32))
+        unistd::write(bfd, buf).map_err(|e| io::Error::from_raw_os_error(e as i32))
     });
     match res {
         Ok(Ok(0)) | Ok(Err(_)) => IoStep::Closed,
@@ -253,7 +253,7 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     // loop. Without this they survive the TCSANOW restore below and land
     // as visible junk in the next program's stdin.
     let stdin_bfd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
-    let _ = termios::tcflush(&stdin_bfd, FlushArg::TCIFLUSH);
+    let _ = termios::tcflush(stdin_bfd, FlushArg::TCIFLUSH);
     0
 }
 
@@ -369,7 +369,7 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
     // escape sequence and leave its remainder visible as literal text.
     let bfd = unsafe { BorrowedFd::borrow_raw(stdout_fd) };
     while !out_buf.is_empty() {
-        match unistd::write(&bfd, &out_buf) {
+        match unistd::write(bfd, &out_buf) {
             Ok(n) if n > 0 => {
                 out_buf.drain(..n);
             }
@@ -386,7 +386,7 @@ fn write_terminal_reset(fd: RawFd) {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
     let mut written = 0;
     while written < TERMINAL_RESET.len() {
-        match unistd::write(&bfd, &TERMINAL_RESET[written..]) {
+        match unistd::write(bfd, &TERMINAL_RESET[written..]) {
             Ok(n) if n > 0 => written += n,
             Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => continue,
             _ => break,
@@ -394,5 +394,5 @@ fn write_terminal_reset(fd: RawFd) {
     }
     // Drain so the reset bytes reach the terminal before we restore termios
     // or exit; otherwise the kernel may discard them.
-    let _ = termios::tcdrain(&bfd);
+    let _ = termios::tcdrain(bfd);
 }

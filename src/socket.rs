@@ -129,18 +129,18 @@ unsafe fn borrow(fd: RawFd) -> BorrowedFd<'static> {
 /// Set FD_CLOEXEC on a file descriptor.
 fn set_cloexec(fd: RawFd) -> io::Result<()> {
     let b = unsafe { borrow(fd) };
-    let flags = fcntl(&b, FcntlArg::F_GETFD).map_err(io_err)?;
+    let flags = fcntl(b, FcntlArg::F_GETFD).map_err(io_err)?;
     let flags = FdFlag::from_bits_truncate(flags);
-    fcntl(&b, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC)).map_err(io_err)?;
+    fcntl(b, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC)).map_err(io_err)?;
     Ok(())
 }
 
 /// Set O_NONBLOCK on a file descriptor.
 fn set_nonblock(fd: RawFd) -> io::Result<()> {
     let b = unsafe { borrow(fd) };
-    let flags = fcntl(&b, FcntlArg::F_GETFL).map_err(io_err)?;
+    let flags = fcntl(b, FcntlArg::F_GETFL).map_err(io_err)?;
     let flags = OFlag::from_bits_truncate(flags);
-    fcntl(&b, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(io_err)?;
+    fcntl(b, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(io_err)?;
     Ok(())
 }
 

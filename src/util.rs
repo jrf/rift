@@ -195,14 +195,13 @@ pub fn write_session_line(
     if let Some(ref cmd) = session.cmd {
         write!(w, "\tcmd={}", cmd)?;
     }
-    if let Some(ended_at) = session.task_ended_at {
-        if ended_at > 0 {
+    if let Some(ended_at) = session.task_ended_at
+        && ended_at > 0 {
             write!(w, "\tended={}", ended_at)?;
             if let Some(exit_code) = session.task_exit_code {
                 write!(w, "\texit_code={}", exit_code)?;
             }
         }
-    }
     if verbose {
         if session.created_at > 0 {
             let now = std::time::SystemTime::now()
@@ -415,10 +414,10 @@ pub fn respond_to_device_attributes(pty_fd: RawFd, data: &[u8]) {
                 continue;
             }
             if data[i..].starts_with(DA2_QUERY) || data[i..].starts_with(DA2_QUERY_EXPLICIT) {
-                let _ = unistd::write(&bfd, DA2_RESPONSE);
+                let _ = unistd::write(bfd, DA2_RESPONSE);
             } else if data[i..].starts_with(DA1_QUERY) || data[i..].starts_with(DA1_QUERY_EXPLICIT)
             {
-                let _ = unistd::write(&bfd, DA1_RESPONSE);
+                let _ = unistd::write(bfd, DA1_RESPONSE);
             }
         }
         i += 1;
