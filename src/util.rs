@@ -461,6 +461,32 @@ pub fn is_kitty_ctrl_backslash(buf: &[u8]) -> bool {
     buf.windows(7).any(|w| w == b"\x1b[92;5u") || buf.windows(9).any(|w| w == b"\x1b[92;5:1u")
 }
 
+/// Find a kitty keyboard flags query response (`CSI ? <flags> u`) anywhere in
+/// `buf` and return the parsed flag byte. Other CSI responses don't end in
+/// `u`, so this is a safe filter even if mouse/focus reports are interleaved.
+pub fn parse_kitty_kbd_response(buf: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i + 3 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'?' {
+            let start = i + 3;
+            let mut end = start;
+            while end < buf.len() && buf[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start
+                && end < buf.len()
+                && buf[end] == b'u'
+                && let Ok(s) = std::str::from_utf8(&buf[start..end])
+                && let Ok(n) = s.parse::<u8>()
+            {
+                return Some(n);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 // -- Terminal serialization (vt100 crate) -------------------------------------
 
 /// Serialize the current terminal state for reattach.

@@ -25,18 +25,19 @@ use super::ignore_signal;
 const MAX_OUT_BUF: usize = 4 * 1024 * 1024;
 
 /// "Be sane" reset sent on attach and detach: disable all common mouse-tracking
-/// variants, focus reporting, bracketed paste; pop one entry off the kitty
-/// keyboard-protocol stack (a program inside the session may have pushed
-/// kitty kbd mode and not popped it before we tore down, leaving subsequent
-/// Ctrl+<key> in the user's shell rendered as literal `N;5u` text); exit
-/// alternate screen (1049 and the older 47); reset SGR; clear+home; show
-/// cursor; exit alternate keypad. DECSTR (`\e[!p`), cursor-position-report
-/// and scrolling-region reset were tried but triggered terminal status
-/// responses that got echoed back to the user's shell — keep this set minimal.
+/// variants, focus reporting, bracketed paste; drain the kitty keyboard-protocol
+/// stack with an over-pop (cleans up any pushed entries the inner session
+/// didn't pop before tearing down); exit alternate screen (1049 and the older
+/// 47); reset SGR; clear+home; show cursor; exit alternate keypad. DECSTR
+/// (`\e[!p`), cursor-position-report and scrolling-region reset were tried
+/// but triggered terminal status responses that got echoed back to the user's
+/// shell — keep this set minimal. The kitty kbd *flags* (set via `CSI = u` by
+/// shells like fish/zsh on startup) are handled separately via query/restore
+/// in `client_async_main` — popping the stack doesn't clear directly-set flags.
 const TERMINAL_RESET: &[u8] = b"\
 \x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\
 \x1b[?2004l\
-\x1b[<u\
+\x1b[<99u\
 \x1b[?1049l\x1b[?47l\
 \x1b[0m\
 \x1b[2J\x1b[H\
@@ -230,15 +231,15 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     };
 
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
+    let saved_kbd_flags = local.block_on(&rt, async move {
         let stream = match UnixStream::from_std(std_socket) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("error: failed to wrap socket: {}", e);
-                return;
+                return None;
             }
         };
-        client_async_main(stream, stdin_fd, stdout_fd).await;
+        client_async_main(stream, stdin_fd, stdout_fd).await
     });
 
     // Programs in the session (starship, vim, mouse-aware tools) may have
@@ -246,6 +247,13 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     // Send the standard "be sane" set before we restore termios so the
     // user's shell isn't stuck reporting mouse coords / hidden cursor.
     write_terminal_reset(stdout_fd);
+
+    // Restore the user's outer-terminal kitty kbd flags last, so we overwrite
+    // any flags an inner shell set during the session. Skipped if the query
+    // got no response (terminal doesn't support the protocol).
+    if let Some(flags) = saved_kbd_flags {
+        write_kitty_kbd_set(stdout_fd, flags);
+    }
 
     // Discard any bytes the terminal had queued on stdin at detach time —
     // typically trailing mouse coords, focus reports, or kitty kbd events
@@ -257,7 +265,11 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     0
 }
 
-async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd) {
+async fn client_async_main(
+    stream: UnixStream,
+    stdin_fd: RawFd,
+    stdout_fd: RawFd,
+) -> Option<u8> {
     use futures_util::{SinkExt, StreamExt};
 
     let (read_half, write_half) = stream.into_split();
@@ -268,14 +280,14 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: failed to wrap stdin: {}", e);
-            return;
+            return None;
         }
     };
     let stdout_async = match AsyncFd::new(StdioFd(stdout_fd)) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: failed to wrap stdout: {}", e);
-            return;
+            return None;
         }
     };
 
@@ -283,9 +295,15 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: failed to register SIGWINCH: {}", e);
-            return;
+            return None;
         }
     };
+
+    // Snapshot the user's outer-terminal kitty keyboard flags so we can
+    // restore them on detach. Inner shells (fish/zsh with kitty integration)
+    // typically *set* flags rather than push/pop, which would otherwise
+    // overwrite the user's setup for the lifetime of their terminal.
+    let saved_kbd_flags = query_kitty_kbd_flags(&stdin_async, stdout_fd).await;
 
     // Send initial size + ssh-auth-sock just like the sync client did.
     let size = ipc::get_terminal_size(stdout_fd);
@@ -380,6 +398,8 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
             _ => break,
         }
     }
+
+    saved_kbd_flags
 }
 
 fn write_terminal_reset(fd: RawFd) {
@@ -395,4 +415,69 @@ fn write_terminal_reset(fd: RawFd) {
     // Drain so the reset bytes reach the terminal before we restore termios
     // or exit; otherwise the kernel may discard them.
     let _ = termios::tcdrain(bfd);
+}
+
+/// Write a kitty keyboard "set flags" sequence (mode 1 = set-all).
+fn write_kitty_kbd_set(fd: RawFd, flags: u8) {
+    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let seq = format!("\x1b[={};1u", flags);
+    let bytes = seq.as_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        match unistd::write(bfd, &bytes[written..]) {
+            Ok(n) if n > 0 => written += n,
+            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => continue,
+            _ => break,
+        }
+    }
+    let _ = termios::tcdrain(bfd);
+}
+
+/// Send a kitty keyboard flags query (`CSI ? u`) and read the response
+/// (`CSI ? <flags> u`) with a short timeout. Returns `None` on timeout or
+/// parse failure — terminals that don't support the protocol simply won't
+/// reply. Any bytes read but unmatched are discarded; in practice this
+/// window (~80ms after raw-mode entry, before main loop) is quiet because
+/// the user just hit Enter to run `rift attach` and isn't typing yet.
+async fn query_kitty_kbd_flags(
+    stdin_async: &AsyncFd<StdioFd>,
+    stdout_fd: RawFd,
+) -> Option<u8> {
+    let bfd = unsafe { BorrowedFd::borrow_raw(stdout_fd) };
+    let query = b"\x1b[?u";
+    let mut written = 0;
+    while written < query.len() {
+        match unistd::write(bfd, &query[written..]) {
+            Ok(n) if n > 0 => written += n,
+            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => continue,
+            _ => return None,
+        }
+    }
+    let _ = termios::tcdrain(bfd);
+
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    let mut tmp = [0u8; 64];
+    let deadline = tokio::time::sleep(std::time::Duration::from_millis(80));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return util::parse_kitty_kbd_response(&buf),
+            ready = stdin_async.readable() => {
+                match try_read(ready, &mut tmp) {
+                    IoStep::Bytes(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(flags) = util::parse_kitty_kbd_response(&buf) {
+                            return Some(flags);
+                        }
+                        if buf.len() > 256 {
+                            return None;
+                        }
+                    }
+                    IoStep::Closed => return util::parse_kitty_kbd_response(&buf),
+                    IoStep::WouldBlock => {}
+                }
+            }
+        }
+    }
 }
