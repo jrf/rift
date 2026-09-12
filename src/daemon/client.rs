@@ -318,10 +318,11 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
         }
     };
 
-    // Send initial size + ssh-auth-sock just like the sync client did.
+    // Init explicitly marks this connection as an attached terminal. Other
+    // commands may send Resize for headless sizing without becoming clients.
     let size = ipc::get_terminal_size(stdout_fd);
     let _ = writer
-        .send((Tag::Resize, Bytes::copy_from_slice(&size.encode())))
+        .send((Tag::Init, Bytes::copy_from_slice(&size.encode())))
         .await;
     if let Ok(ssh_auth_sock) = std::env::var("SSH_AUTH_SOCK") {
         let _ = writer
@@ -391,10 +392,16 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
                         // Daemon is handing us off to another session. Payload is
                         // `name\ncwd`; the cwd (this session's live dir) is used
                         // to spawn the target if it doesn't exist yet.
-                        if let Some((name, cwd)) = parse_switch_payload(&payload) {
+                        if let Some((name, cwd)) = ipc::decode_switch(&payload) {
                             outcome = ClientOutcome::Switch { name, cwd };
                         }
                         break;
+                    }
+                    Tag::Resize if payload.is_empty() => {
+                        let size = ipc::get_terminal_size(stdout_fd);
+                        let _ = writer
+                            .send((Tag::Resize, Bytes::copy_from_slice(&size.encode())))
+                            .await;
                     }
                     Tag::Detach => break,
                     _ => {}
@@ -433,20 +440,6 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
     outcome
 }
 
-/// Parse a `Switch` payload of the form `name` or `name\ncwd` into the target
-/// session name and optional cwd. Returns `None` when the name is empty.
-fn parse_switch_payload(payload: &[u8]) -> Option<(String, Option<String>)> {
-    let text = std::str::from_utf8(payload).ok()?;
-    let (name, cwd) = match text.split_once('\n') {
-        Some((name, cwd)) => (name, (!cwd.is_empty()).then(|| cwd.to_string())),
-        None => (text, None),
-    };
-    if name.is_empty() {
-        return None;
-    }
-    Some((name.to_string(), cwd))
-}
-
 fn write_terminal_reset(fd: RawFd) {
     write_bytes(fd, TERMINAL_RESET);
 }
@@ -469,7 +462,7 @@ fn write_bytes(fd: RawFd, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_switch_payload, should_detach};
+    use super::should_detach;
 
     #[test]
     fn detach_key_can_be_disabled() {
@@ -477,26 +470,5 @@ mod tests {
         assert!(should_detach(b"\x1b[92;5u", false));
         assert!(!should_detach(&[0x1c], true));
         assert!(!should_detach(b"\x1b[92;5u", true));
-    }
-
-    #[test]
-    fn switch_payload_splits_name_and_cwd() {
-        assert_eq!(
-            parse_switch_payload(b"work\n/home/me/project"),
-            Some(("work".to_string(), Some("/home/me/project".to_string())))
-        );
-        // Name only (no cwd).
-        assert_eq!(
-            parse_switch_payload(b"work"),
-            Some(("work".to_string(), None))
-        );
-        // Trailing newline with empty cwd yields no cwd.
-        assert_eq!(
-            parse_switch_payload(b"work\n"),
-            Some(("work".to_string(), None))
-        );
-        // Empty name is rejected.
-        assert_eq!(parse_switch_payload(b""), None);
-        assert_eq!(parse_switch_payload(b"\n/tmp"), None);
     }
 }

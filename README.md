@@ -24,7 +24,7 @@ mise use ubi:jrf/rift        # or: mise use cargo:rift  (build from source)
 cargo install --git https://github.com/jrf/rift
 ```
 
-See [`packaging/`](packaging/) for the Homebrew formula, Mise/aqua metadata, and
+See [`packaging/`](packaging/) for the Homebrew formula, Mise metadata, and
 the release process.
 
 ### From source
@@ -50,7 +50,7 @@ rift attach --labels "k=v ..." <session>  Attach/create with labels set atomical
 rift new <session>            Same as attach -d
 rift list [-s|-v] [--where k=v] List sessions, optionally filtered by label
 rift get <session> [key]      Get all labels or one label value
-rift set <session> k=v...     Set session labels
+rift set <session> k=v...     Set session labels (grouped "k=v k2=v2" also accepted)
 rift unset <session> key...   Remove session labels
 rift clear <session>          Clear all session labels
 rift run <session> [<cmd...>] Run a command or piped script (-d for detached, --fish)
@@ -69,7 +69,7 @@ rift wait <name>...           Wait for sessions to complete
 rift completions <shell>      Print completions (bash, zsh, fish, nu)
 ```
 
-All subcommands have short aliases: `a`, `n`, `r`, `s`, `p`, `wr`, `t`, `hi`, `lg`, `la`, `pe`, `d`, `rn`, `k`, `w`, `l`/`ls`, `c`, `v`, `h`.
+All subcommands have short aliases: `a`, `n`, `r`, `s`, `p`, `wr`, `t`, `hi`, `lg`, `la`, `pe`, `d`, `rn`, `k`, `w`, `l`/`ls`, `c`, `v`, `h`. Commands that address the current session accept `.` as shorthand for `$RIFT_SESSION`.
 
 **Detach key:** `Ctrl+\`
 
@@ -169,7 +169,7 @@ refreshes `DISPLAY`/`KITTY_WINDOW_ID`/etc. for long-lived programs.
 └──────────┘                     └──────────┘              └───────┘
 ```
 
-The daemon forks on first attach, creates a PTY, and spawns a shell. Both daemon and client run on a single-threaded tokio runtime (`current_thread` + `LocalSet`). The daemon's main task multiplexes the listening socket, PTY master (`AsyncFd<OwnedFd>`), and `SIGCHLD`/`SIGTERM` via `tokio::select!`; each accepted client is its own task that talks back through an mpsc channel. Terminal state is tracked via a vt100 parser and replayed to reattaching clients.
+The daemon forks on first attach, creates a PTY, and spawns a shell. Both daemon and client run on a single-threaded tokio runtime (`current_thread` + `LocalSet`). The daemon's main task multiplexes the listening socket, PTY master (`AsyncFd<OwnedFd>`), and `SIGCHLD`/`SIGTERM` via `tokio::select!`; each accepted client is its own task that talks back through an mpsc channel. Terminal state is tracked with `alacritty_terminal` and replayed to reattaching clients.
 
 When multiple interactive clients are attached, the client that most recently
 sent keyboard input owns PTY resizing. One-shot `rift send` and terminal

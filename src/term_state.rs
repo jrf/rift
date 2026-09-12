@@ -36,8 +36,8 @@ impl alacritty_terminal::grid::Dimensions for Size {
     }
 }
 
-/// Scrollback capacity (matches zmx's 2k-line buffer).
-const SCROLLBACK: usize = 2000;
+/// Scrollback capacity, aligned with current zmx/ghostty defaults.
+const SCROLLBACK: usize = 10_000;
 
 /// Shared window title, updated by the terminal's OSC 0/2 handling.
 ///
@@ -99,7 +99,19 @@ impl TermState {
 
     /// Latest working directory reported via OSC 7, if the shell emits it.
     pub fn cwd(&self) -> Option<String> {
+        self.cwd.as_deref().and_then(local_file_uri_path)
+    }
+
+    /// Complete OSC 7 URI, including its host. This is what `list` and terminal
+    /// replay expose so remote SSH working directories remain distinguishable.
+    pub fn cwd_uri(&self) -> Option<String> {
         self.cwd.clone()
+    }
+
+    pub fn focus_reporting(&self) -> bool {
+        self.term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT)
     }
 
     /// Latest window title reported via OSC 0/2, if any.
@@ -263,7 +275,7 @@ impl TermState {
             out.extend_from_slice(b"\x1b\\");
         }
         if let Some(cwd) = self.cwd.as_deref() {
-            out.extend_from_slice(b"\x1b]7;file://");
+            out.extend_from_slice(b"\x1b]7;");
             out.extend_from_slice(cwd.as_bytes());
             out.extend_from_slice(b"\x1b\\");
         }
@@ -401,25 +413,32 @@ fn scan_osc7_cwd(data: &[u8]) -> Option<String> {
             end += 1;
         }
         if let Ok(uri) = std::str::from_utf8(&data[body_start..end])
-            && let Some(path) = parse_file_uri_path(uri)
+            && uri.starts_with("file://")
         {
-            result = Some(path);
+            result = Some(uri.to_string());
         }
         search_from = end.max(body_start);
     }
     result
 }
 
-/// Extract the path from a `file://host/path` URI, percent-decoding it.
-/// Returns `None` if the value isn't a `file:` URI.
-fn parse_file_uri_path(uri: &str) -> Option<String> {
+/// Return a decoded path only when an OSC 7 URI identifies this machine.
+/// Remote hosts are intentionally not treated as local filesystem paths.
+fn local_file_uri_path(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("file://")?;
-    // Strip the optional host component (everything up to the first '/').
-    let path = match rest.find('/') {
-        Some(idx) => &rest[idx..],
-        None => rest,
-    };
-    Some(percent_decode(path))
+    let slash = rest.find('/')?;
+    let host = &rest[..slash];
+    let local_host = std::env::var("HOSTNAME").ok().or_else(|| {
+        let mut buf = [0u8; 256];
+        (unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0).then(|| {
+            let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+            String::from_utf8_lossy(&buf[..len]).into_owned()
+        })
+    });
+    if !host.is_empty() && host != "localhost" && local_host.as_deref() != Some(host) {
+        return None;
+    }
+    Some(percent_decode(&rest[slash..]))
 }
 
 /// Minimal percent-decoding for OSC 7 paths (`%20` etc.).
@@ -840,11 +859,23 @@ mod tests {
     #[test]
     fn tracks_and_replays_osc7_cwd() {
         // OSC 7 reports the working directory as a file URI.
-        let source = terminal(24, 80, b"\x1b]7;file://host/home/user/proj\x1b\\prompt$ ");
+        let source = terminal(
+            24,
+            80,
+            b"\x1b]7;file://localhost/home/user/proj\x1b\\prompt$ ",
+        );
+        assert_eq!(
+            source.cwd_uri().as_deref(),
+            Some("file://localhost/home/user/proj")
+        );
         assert_eq!(source.cwd().as_deref(), Some("/home/user/proj"));
 
-        // The serialized state carries OSC 7 so a reattaching terminal tracks it.
+        // The serialized state carries the complete OSC 7 URI.
         let dest = roundtrip(&source);
+        assert_eq!(
+            dest.cwd_uri().as_deref(),
+            Some("file://localhost/home/user/proj")
+        );
         assert_eq!(dest.cwd().as_deref(), Some("/home/user/proj"));
     }
 
@@ -853,12 +884,22 @@ mod tests {
         let source = terminal(
             24,
             80,
-            b"\x1b]7;file://h/tmp/a%20b\x07\x1b]7;file://h/tmp/final\x07",
+            b"\x1b]7;file://localhost/tmp/a%20b\x07\x1b]7;file://localhost/tmp/final\x07",
         );
         assert_eq!(source.cwd().as_deref(), Some("/tmp/final"));
 
-        let earlier = terminal(24, 80, b"\x1b]7;file://h/tmp/a%20b\x07");
+        let earlier = terminal(24, 80, b"\x1b]7;file://localhost/tmp/a%20b\x07");
         assert_eq!(earlier.cwd().as_deref(), Some("/tmp/a b"));
+    }
+
+    #[test]
+    fn osc7_preserves_remote_host_without_exposing_local_path() {
+        let source = terminal(24, 80, b"\x1b]7;file://remote.example/home/me\x07");
+        assert_eq!(
+            source.cwd_uri().as_deref(),
+            Some("file://remote.example/home/me")
+        );
+        assert_eq!(source.cwd(), None);
     }
 
     #[test]

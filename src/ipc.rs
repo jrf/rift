@@ -24,6 +24,8 @@ pub enum Tag {
     Run = 9,
     TaskComplete = 10,
     Switch = 11,
+    /// Subscribe a non-terminal client to live PTY output (`rift tail`).
+    Tail = 12,
     Print = 14,
     SshAuthSock = 15,
     Rename = 16,
@@ -52,6 +54,7 @@ impl Tag {
             9 => Some(Tag::Run),
             10 => Some(Tag::TaskComplete),
             11 => Some(Tag::Switch),
+            12 => Some(Tag::Tail),
             14 => Some(Tag::Print),
             15 => Some(Tag::SshAuthSock),
             16 => Some(Tag::Rename),
@@ -72,6 +75,167 @@ pub const HEADER_SIZE: usize = 5; // 1 byte tag + 4 bytes len
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 pub const REQUEST_ID_SIZE: usize = std::mem::size_of::<u64>();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFormat {
+    Plain,
+    Vt,
+    Html,
+}
+
+impl HistoryFormat {
+    fn decode(payload: &[u8]) -> Option<Self> {
+        match payload {
+            [] | [0] => Some(Self::Plain),
+            [1] => Some(Self::Vt),
+            [2] => Some(Self::Html),
+            _ => None,
+        }
+    }
+
+    pub fn encode(self) -> [u8; 1] {
+        [match self {
+            Self::Plain => 0,
+            Self::Vt => 1,
+            Self::Html => 2,
+        }]
+    }
+}
+
+/// Validated client-to-daemon messages. This preserves the existing tag wire
+/// format while moving direction and payload-shape semantics out of daemon
+/// request handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientRequest {
+    Input(Bytes),
+    Resize(Resize),
+    Detach,
+    DetachAll,
+    Kill,
+    Info,
+    AttachTerminal(Resize),
+    History(HistoryFormat),
+    Run(Bytes),
+    Switch(String),
+    SubscribeOutput,
+    Print(Bytes),
+    SshAuthSock(String),
+    Rename(String),
+    LabelGet,
+    LabelSet(String),
+    LabelClear,
+    EnvSet(Option<String>),
+    EnvGet,
+}
+
+impl ClientRequest {
+    pub fn decode(tag: Tag, payload: Bytes) -> io::Result<Self> {
+        fn require_empty(tag: Tag, payload: &Bytes) -> io::Result<()> {
+            if payload.is_empty() {
+                Ok(())
+            } else {
+                Err(invalid_payload(tag, "expected an empty payload"))
+            }
+        }
+
+        fn utf8(tag: Tag, payload: &Bytes, allow_empty: bool) -> io::Result<String> {
+            let value =
+                std::str::from_utf8(payload).map_err(|_| invalid_payload(tag, "expected UTF-8"))?;
+            if !allow_empty && value.is_empty() {
+                return Err(invalid_payload(tag, "expected a non-empty payload"));
+            }
+            Ok(value.to_string())
+        }
+
+        let request = match tag {
+            Tag::Input => Self::Input(payload),
+            Tag::Resize => Self::Resize(
+                Resize::decode(&payload).ok_or_else(|| invalid_payload(tag, "invalid resize"))?,
+            ),
+            Tag::Detach => {
+                require_empty(tag, &payload)?;
+                Self::Detach
+            }
+            Tag::DetachAll => {
+                require_empty(tag, &payload)?;
+                Self::DetachAll
+            }
+            Tag::Kill => {
+                require_empty(tag, &payload)?;
+                Self::Kill
+            }
+            Tag::Info => {
+                require_empty(tag, &payload)?;
+                Self::Info
+            }
+            Tag::Init => Self::AttachTerminal(
+                Resize::decode(&payload).ok_or_else(|| invalid_payload(tag, "invalid resize"))?,
+            ),
+            Tag::History => Self::History(
+                HistoryFormat::decode(&payload)
+                    .ok_or_else(|| invalid_payload(tag, "invalid history format"))?,
+            ),
+            Tag::Run if !payload.is_empty() => Self::Run(payload),
+            Tag::Run => return Err(invalid_payload(tag, "expected a non-empty payload")),
+            Tag::Switch => Self::Switch(utf8(tag, &payload, false)?),
+            Tag::Tail => {
+                require_empty(tag, &payload)?;
+                Self::SubscribeOutput
+            }
+            Tag::Print => Self::Print(payload),
+            Tag::SshAuthSock => Self::SshAuthSock(utf8(tag, &payload, false)?),
+            Tag::Rename => Self::Rename(utf8(tag, &payload, false)?),
+            Tag::LabelGet => {
+                require_empty(tag, &payload)?;
+                Self::LabelGet
+            }
+            Tag::LabelSet => Self::LabelSet(utf8(tag, &payload, true)?),
+            Tag::LabelClear => {
+                require_empty(tag, &payload)?;
+                Self::LabelClear
+            }
+            Tag::EnvSet => Self::EnvSet(if payload.is_empty() {
+                None
+            } else {
+                Some(utf8(tag, &payload, false)?)
+            }),
+            Tag::EnvGet => {
+                require_empty(tag, &payload)?;
+                Self::EnvGet
+            }
+            Tag::Output | Tag::TaskComplete | Tag::Ack | Tag::LabelData | Tag::EnvData => {
+                return Err(invalid_payload(tag, "tag is not a client request"));
+            }
+        };
+        Ok(request)
+    }
+}
+
+fn invalid_payload(tag: Tag, message: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid {:?} frame: {}", tag, message),
+    )
+}
+
+pub fn encode_switch(name: &str, cwd: Option<&str>) -> Bytes {
+    let mut payload = Vec::with_capacity(name.len() + cwd.map_or(0, |cwd| cwd.len() + 1));
+    payload.extend_from_slice(name.as_bytes());
+    if let Some(cwd) = cwd {
+        payload.push(b'\n');
+        payload.extend_from_slice(cwd.as_bytes());
+    }
+    Bytes::from(payload)
+}
+
+pub fn decode_switch(payload: &[u8]) -> Option<(String, Option<String>)> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let (name, cwd) = match text.split_once('\n') {
+        Some((name, cwd)) => (name, (!cwd.is_empty()).then(|| cwd.to_string())),
+        None => (text, None),
+    };
+    (!name.is_empty()).then(|| (name.to_string(), cwd))
+}
+
 pub fn encode_task_complete(request_id: u64, exit_code: u8) -> Bytes {
     let mut payload = Vec::with_capacity(REQUEST_ID_SIZE + 1);
     payload.extend_from_slice(&request_id.to_le_bytes());
@@ -87,7 +251,7 @@ pub fn decode_task_complete(payload: &[u8]) -> Option<(u64, u8)> {
     Some((request_id, payload[REQUEST_ID_SIZE]))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resize {
     pub rows: u16,
     pub cols: u16,
@@ -113,12 +277,12 @@ impl Resize {
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::MIN_WIRE_LEN {
+        if !matches!(data.len(), Self::MIN_WIRE_LEN | Self::WIRE_LEN) {
             return None;
         }
-        // Pixel dimensions were added later; a shorter payload just means the
-        // peer didn't send them, so default those fields to 0 (== unknown).
-        let (xpixel, ypixel) = if data.len() >= Self::WIRE_LEN {
+        // Pixel dimensions were added later; the legacy four-byte payload just
+        // means the peer didn't send them, so default those fields to 0.
+        let (xpixel, ypixel) = if data.len() == Self::WIRE_LEN {
             (
                 u16::from_le_bytes([data[4], data[5]]),
                 u16::from_le_bytes([data[6], data[7]]),
@@ -493,8 +657,8 @@ pub fn request_response(
 // ---------------------------------------------------------------------------
 
 /// Async codec for the rift wire protocol, used with `tokio_util::codec::Framed`.
-/// Wire format per frame: `[1 byte tag][4 bytes len LE][payload]`. Unknown
-/// tag bytes are silently skipped (matching `SocketBuffer::next` behavior).
+/// Wire format per frame: `[1 byte tag][4 bytes len LE][payload]`. Unknown tags
+/// and oversized frames are rejected as malformed input.
 pub struct RiftCodec;
 
 impl Decoder for RiftCodec {
@@ -518,9 +682,15 @@ impl Decoder for RiftCodec {
             return Ok(None);
         }
         let tag_byte = src[0];
+        let tag = Tag::from_u8(tag_byte).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown protocol tag: {tag_byte}"),
+            )
+        })?;
         src.advance(HEADER_SIZE);
         let payload = src.split_to(len).freeze();
-        Ok(Tag::from_u8(tag_byte).map(|t| (t, payload)))
+        Ok(Some((tag, payload)))
     }
 }
 
@@ -590,6 +760,7 @@ mod tests {
             (Tag::Run, 9),
             (Tag::TaskComplete, 10),
             (Tag::Switch, 11),
+            (Tag::Tail, 12),
             (Tag::Print, 14),
             (Tag::SshAuthSock, 15),
             (Tag::Rename, 16),
@@ -685,6 +856,64 @@ mod tests {
     }
 
     #[test]
+    fn client_request_validates_payloads_and_direction() {
+        let resize = Resize {
+            rows: 40,
+            cols: 120,
+            xpixel: 1920,
+            ypixel: 1080,
+        };
+        assert_eq!(
+            ClientRequest::decode(Tag::Init, Bytes::copy_from_slice(&resize.encode())).unwrap(),
+            ClientRequest::AttachTerminal(resize)
+        );
+        assert_eq!(
+            ClientRequest::decode(Tag::Resize, Bytes::from_static(&[40, 0, 120, 0])).unwrap(),
+            ClientRequest::Resize(Resize {
+                rows: 40,
+                cols: 120,
+                xpixel: 0,
+                ypixel: 0,
+            })
+        );
+        for malformed in [
+            Bytes::new(),
+            Bytes::from_static(&[1; 5]),
+            Bytes::from_static(&[1; 9]),
+        ] {
+            assert!(ClientRequest::decode(Tag::Resize, malformed).is_err());
+        }
+        assert_eq!(
+            ClientRequest::decode(Tag::History, Bytes::new()).unwrap(),
+            ClientRequest::History(HistoryFormat::Plain)
+        );
+        assert_eq!(
+            ClientRequest::decode(Tag::History, Bytes::from_static(&[2])).unwrap(),
+            ClientRequest::History(HistoryFormat::Html)
+        );
+        assert!(ClientRequest::decode(Tag::History, Bytes::from_static(&[3])).is_err());
+        assert!(ClientRequest::decode(Tag::Detach, Bytes::from_static(b"unexpected")).is_err());
+        assert!(ClientRequest::decode(Tag::Run, Bytes::new()).is_err());
+        assert!(ClientRequest::decode(Tag::Rename, Bytes::new()).is_err());
+        assert!(ClientRequest::decode(Tag::Rename, Bytes::from_static(&[0xff])).is_err());
+        assert!(ClientRequest::decode(Tag::Output, Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn switch_payload_round_trips() {
+        assert_eq!(
+            decode_switch(&encode_switch("target", Some("/tmp/work"))),
+            Some(("target".to_string(), Some("/tmp/work".to_string())))
+        );
+        assert_eq!(
+            decode_switch(&encode_switch("target", None)),
+            Some(("target".to_string(), None))
+        );
+        assert_eq!(decode_switch(b"\n/tmp"), None);
+        assert_eq!(decode_switch(&[0xff]), None);
+    }
+
+    #[test]
     fn codec_rejects_oversized_frame_before_reserving_payload() {
         let mut encoded = BytesMut::new();
         encoded.put_u8(Tag::Input as u8);
@@ -693,6 +922,21 @@ mod tests {
         let error = RiftCodec
             .decode(&mut encoded)
             .expect_err("oversized frame must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn codec_rejects_unknown_tag_even_when_followed_by_valid_frame() {
+        let mut encoded = BytesMut::new();
+        encoded.put_u8(13);
+        encoded.put_u32_le(0);
+        RiftCodec
+            .encode((Tag::Input, Bytes::from_static(b"next")), &mut encoded)
+            .unwrap();
+
+        let error = RiftCodec
+            .decode(&mut encoded)
+            .expect_err("unknown tag must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 

@@ -26,6 +26,19 @@ impl RiftTest {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rift"));
         command
+            // Tests must not inherit rift's own session context or behavior
+            // overrides from the shell running the suite. Individual tests can
+            // opt back into a variable through `spawn_pty_env`.
+            .env_remove("RIFT_SESSION")
+            .env_remove("RIFT_SESSION_PREFIX")
+            .env_remove("RIFT_TRACK_ENV")
+            .env_remove("RIFT_NO_DETACH_KEY")
+            .env_remove("RIFT_PICKER")
+            .env_remove("RIFT_ON_ATTACH")
+            .env_remove("RIFT_ON_DETACH")
+            .env_remove("RIFT_ON_EXIT")
+            .env_remove("RIFT_DIR_MODE")
+            .env_remove("RIFT_LOG_MODE")
             .env("RIFT_DIR", &self.dir)
             .env("RIFT_SHELL", "/bin/sh")
             .env("RIFT_EMPTY_TIMEOUT", "30");
@@ -116,11 +129,26 @@ fn send_frame(stream: &mut UnixStream, tag: u8, payload: &[u8]) {
 }
 
 fn read_frame(stream: &mut UnixStream) -> (u8, Vec<u8>) {
+    fn read_exact_retry(stream: &mut UnixStream, mut buf: &mut [u8]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !buf.is_empty() {
+            match stream.read(buf) {
+                Ok(0) => panic!("socket closed while reading frame"),
+                Ok(n) => buf = &mut buf[n..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "timed out reading frame");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("read frame: {error}"),
+            }
+        }
+    }
+
     let mut header = [0; 5];
-    stream.read_exact(&mut header).expect("read frame header");
+    read_exact_retry(stream, &mut header);
     let length = u32::from_le_bytes(header[1..].try_into().expect("frame length")) as usize;
     let mut payload = vec![0; length];
-    stream.read_exact(&mut payload).expect("read frame payload");
+    read_exact_retry(stream, &mut payload);
     (header[0], payload)
 }
 
@@ -129,6 +157,108 @@ fn resize_payload(rows: u16, cols: u16) -> [u8; 4] {
     payload[..2].copy_from_slice(&rows.to_le_bytes());
     payload[2..].copy_from_slice(&cols.to_le_bytes());
     payload
+}
+
+#[test]
+fn control_clients_receive_output_only_after_subscribing() {
+    let test = RiftTest::new();
+    assert!(
+        test.output(&["new", "output-subscription"])
+            .status
+            .success()
+    );
+    test.wait_for_session("output-subscription");
+
+    let socket = test.dir.join("output-subscription");
+    let mut control = UnixStream::connect(&socket).expect("connect control client");
+    control
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set control client read timeout");
+
+    assert!(
+        test.output(&["print", "output-subscription", "before"])
+            .status
+            .success()
+    );
+    let mut byte = [0];
+    let error = control
+        .read(&mut byte)
+        .expect_err("control client must not receive PTY output");
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "unexpected read error: {error}"
+    );
+
+    control
+        .set_read_timeout(None)
+        .expect("clear control client read timeout");
+    send_frame(&mut control, 12, &[]);
+    assert!(
+        test.output(&["print", "output-subscription", "after"])
+            .status
+            .success()
+    );
+    let (tag, payload) = read_frame(&mut control);
+    assert_eq!(tag, 1);
+    assert_eq!(payload, b"after");
+}
+
+#[test]
+fn info_counts_only_initialized_terminal_clients() {
+    let test = RiftTest::new();
+    let create = test.output(&["new", "client-count"]);
+    assert!(create.status.success());
+    test.wait_for_session("client-count");
+
+    let socket = test.dir.join("client-count");
+    let mut terminal = UnixStream::connect(&socket).expect("connect terminal");
+    send_frame(&mut terminal, 7, &resize_payload(24, 80));
+    std::thread::sleep(Duration::from_millis(50));
+
+    let listed = test.output(&["list"]);
+    let output = String::from_utf8_lossy(&listed.stdout);
+    assert!(output.contains("clients=1"), "{output}");
+}
+
+#[test]
+fn kill_then_immediate_recreate_same_name_succeeds() {
+    let test = RiftTest::new();
+    for _ in 0..3 {
+        assert!(
+            test.output(&["new", "race", "sleep", "30"])
+                .status
+                .success()
+        );
+        test.wait_for_session("race");
+        assert!(test.output(&["kill", "race"]).status.success());
+        let recreated = test.output(&["new", "race", "sleep", "30"]);
+        assert!(
+            recreated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&recreated.stderr)
+        );
+        test.wait_for_session("race");
+        assert!(test.output(&["kill", "race"]).status.success());
+    }
+}
+
+#[test]
+fn grouped_labels_are_accepted() {
+    let test = RiftTest::new();
+    assert!(test.output(&["new", "grouped-labels"]).status.success());
+    test.wait_for_session("grouped-labels");
+    assert!(
+        test.output(&["set", "grouped-labels", "a=1 b=2"])
+            .status
+            .success()
+    );
+    let labels = test.output(&["get", "grouped-labels"]);
+    let output = String::from_utf8_lossy(&labels.stdout);
+    assert!(output.contains("a=1"), "{output}");
+    assert!(output.contains("b=2"), "{output}");
 }
 
 #[test]
@@ -238,8 +368,8 @@ fn keyboard_input_transfers_resize_ownership_between_clients() {
     let mut first = UnixStream::connect(&socket).expect("connect first interactive client");
     let mut second = UnixStream::connect(&socket).expect("connect second interactive client");
 
-    send_frame(&mut first, 2, &resize_payload(20, 80));
-    send_frame(&mut second, 2, &resize_payload(40, 100));
+    send_frame(&mut first, 7, &resize_payload(20, 80));
+    send_frame(&mut second, 7, &resize_payload(40, 100));
     std::thread::sleep(Duration::from_millis(100));
 
     let before = test.output(&["run", "leadership", "stty", "size"]);
@@ -250,6 +380,9 @@ fn keyboard_input_transfers_resize_ownership_between_clients() {
     );
 
     send_frame(&mut second, 0, b"\r");
+    // Leadership transfer requests a fresh size; report the second terminal's
+    // current dimensions as the real client does.
+    send_frame(&mut second, 2, &resize_payload(40, 100));
     std::thread::sleep(Duration::from_millis(100));
 
     let after = test.output(&["run", "leadership", "stty", "size"]);
@@ -291,11 +424,23 @@ fn reattach_restores_active_alternate_screen_mode() {
     }
 
     let socket = test.dir.join("alternate-screen");
-    let mut client = UnixStream::connect(&socket).expect("connect client");
+    // First attachment establishes that subsequent terminal clients are
+    // reattachments. Initial clients receive live output rather than replay.
+    let mut initial = UnixStream::connect(&socket).expect("connect initial client");
+    send_frame(&mut initial, 7, &resize_payload(24, 80));
+    drop(initial);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut client = UnixStream::connect(&socket).expect("connect reattaching client");
     client
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
-    let (tag, payload) = read_frame(&mut client);
+    send_frame(&mut client, 7, &resize_payload(24, 80));
+    let (mut tag, mut payload) = read_frame(&mut client);
+    // Leadership establishment also asks the client for a fresh size.
+    if tag == 2 && payload.is_empty() {
+        (tag, payload) = read_frame(&mut client);
+    }
 
     assert_eq!(tag, 7, "expected Init frame");
     assert!(
@@ -563,7 +708,7 @@ fn switch_request_relays_to_leader_client_with_cwd() {
     leader
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
-    send_frame(&mut leader, 2, &resize_payload(24, 80)); // Tag::Resize == 2
+    send_frame(&mut leader, 7, &resize_payload(24, 80)); // Tag::Init == 7
     std::thread::sleep(Duration::from_millis(100));
 
     // A separate transient client asks the daemon to switch to "switch-dst".
@@ -640,6 +785,42 @@ fn detached_run_uses_sane_size_without_a_terminal() {
         "{}",
         String::from_utf8_lossy(&history.stdout)
     );
+}
+
+#[test]
+fn empty_write_creates_an_empty_file() {
+    let test = RiftTest::new();
+    assert!(test.output(&["new", "empty-write"]).status.success());
+    test.wait_for_session("empty-write");
+    let path = test.dir.join("empty.txt");
+    let mut child = test
+        .command()
+        .args(["write", "empty-write", path.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn empty write");
+    drop(child.stdin.take());
+    assert!(child.wait().expect("wait empty write").success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !path.exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fs::read(path).expect("read empty file"), b"");
+}
+
+#[test]
+fn print_injects_exact_bytes_without_a_newline() {
+    let test = RiftTest::new();
+    assert!(test.output(&["new", "exact-print"]).status.success());
+    test.wait_for_session("exact-print");
+    assert!(
+        test.output(&["print", "exact-print", "EXACT_MARK"])
+            .status
+            .success()
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    let history = test.output(&["history", "--vt", "exact-print"]);
+    assert!(history.stdout.windows(10).any(|w| w == b"EXACT_MARK"));
 }
 
 #[test]

@@ -9,7 +9,7 @@ mod socket;
 mod term_state;
 mod util;
 
-use crate::util::HistoryFormat;
+use crate::ipc::HistoryFormat;
 
 // ---------------------------------------------------------------------------
 // CLI parsing
@@ -193,7 +193,7 @@ fn parse_args_from(args: Vec<String>) -> Command {
     let first = args[0].as_str();
     match first {
         "--help" | "-h" | "help" | "h" => Command::Help,
-        "--version" | "-V" | "version" | "v" => Command::Version,
+        "--version" | "-V" | "-v" | "version" | "v" => Command::Version,
         "list" | "ls" | "l" => {
             let short = args.iter().any(|a| a == "-s" || a == "--short");
             let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
@@ -729,6 +729,11 @@ mod tests {
                 force_new: true,
             }
         );
+    }
+
+    #[test]
+    fn lowercase_v_is_a_version_alias() {
+        assert_eq!(parse_args_from(strings(&["-v"])), Command::Version);
     }
 
     #[test]

@@ -37,11 +37,20 @@ impl std::fmt::Display for SessionNameError {
 /// Validate and combine prefix + session name.
 /// Rejects `/`, null bytes, `.`, and `..`.
 pub fn get_session_name(prefix: &str, name: &str) -> Result<String, SessionNameError> {
+    let name = if name == "." {
+        let current = session_name_from_env();
+        if current.is_empty() {
+            return Err(SessionNameError::Required);
+        }
+        return Ok(current);
+    } else {
+        name
+    };
     if prefix.is_empty() && name.is_empty() {
         return Err(SessionNameError::Required);
     }
     let full = format!("{}{}", prefix, name);
-    if full.contains('/') || full.contains('\0') || full == "." || full == ".." {
+    if full.contains('/') || full.contains('\0') || full == ".." {
         return Err(SessionNameError::Invalid);
     }
     Ok(full)
@@ -273,5 +282,18 @@ pub fn update_ssh_auth_sock_symlink(socket_dir: &Path, session_name: &str, targe
     }
     if !target_path.is_empty() {
         let _ = std::os::unix::fs::symlink(target_path, &symlink_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_resolves_to_current_session() {
+        // SAFETY: this unit test does not spawn threads which inspect this env var.
+        unsafe { std::env::set_var("RIFT_SESSION", "inside") };
+        assert_eq!(get_session_name("prefix-", ".").unwrap(), "inside");
+        unsafe { std::env::remove_var("RIFT_SESSION") };
     }
 }

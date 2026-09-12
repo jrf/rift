@@ -14,7 +14,6 @@ rust-version = "1.85"
 
 [dependencies]
 base64 = "0.22"
-env_logger = "0.11.9"
 libc = "0.2.183"
 log = "0.4.29"
 nix = { version = "0.31.2", features = ["poll", "signal", "term", "fs", "net", "process"] }

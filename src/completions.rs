@@ -152,7 +152,8 @@ complete -c rift -n "__fish_is_nth_token 1" -a 'h help' -d 'Print help'
 complete -c rift -s h -d 'Print help'
 complete -c rift -n "__fish_is_nth_token 1" -a '(__fish_complete_command)' -d 'Command'
 
-complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w rename rn logs lg get g set unset un clear cl print-env pe" -a '(rift list --short 2>/dev/null)' -d 'Session name'
+complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr detach d history hi rename rn logs lg get g set unset un clear cl print-env pe" -a '(rift list --short 2>/dev/null)' -d 'Session name'
+complete -c rift -n "__fish_seen_subcommand_from tail t kill k wait w; and not __fish_seen_subcommand_from --help -h" -a '(rift list --short 2>/dev/null)' -d 'Session name'
 
 complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish nu' -d Shell
 

@@ -37,6 +37,7 @@ class Rift < Formula
 
   def install
     bin.install "rift"
+    generate_completions_from_executable(bin/"rift", "completions")
   end
 
   test do

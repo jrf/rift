@@ -663,15 +663,6 @@ fn leading_number(field: &[u8]) -> Option<u32> {
     std::str::from_utf8(&field[..end]).ok()?.parse().ok()
 }
 
-// -- Terminal serialization ---------------------------------------------------
-
-/// Serialize the current terminal state for reattach.
-/// Returns the VT escape sequences needed to reproduce the screen (including
-/// scrollback for the primary screen).
-pub fn serialize_terminal_state(term: &crate::term_state::TermState) -> Option<Vec<u8>> {
-    term.serialize_state()
-}
-
 /// Force OSC 133 prompt markers to tell the outer terminal not to redraw.
 ///
 /// Kitty shell integration otherwise clears prompt lines after resize while
@@ -739,23 +730,15 @@ fn find_osc_terminator(data: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum HistoryFormat {
-    Plain = 0,
-    Vt = 1,
-    Html = 2,
-}
-
 /// Serialize terminal contents in the requested format.
 pub fn serialize_terminal(
     term: &crate::term_state::TermState,
-    format: HistoryFormat,
+    format: ipc::HistoryFormat,
 ) -> Option<Vec<u8>> {
     let data = match format {
-        HistoryFormat::Plain => term.contents_plain(),
-        HistoryFormat::Vt => term.contents_vt(),
-        HistoryFormat::Html => term.contents_html(),
+        ipc::HistoryFormat::Plain => term.contents_plain(),
+        ipc::HistoryFormat::Vt => term.contents_vt(),
+        ipc::HistoryFormat::Html => term.contents_html(),
     };
     if data.is_empty() { None } else { Some(data) }
 }

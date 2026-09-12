@@ -8,7 +8,6 @@ Distribution metadata and the release process for rift.
 |---|---|
 | `homebrew/rift.rb` | Homebrew formula that installs the prebuilt release binary. Copy into a tap (`homebrew-rift/Formula/rift.rb`) or `brew install --formula` it directly. |
 | `mise/.mise.toml` | Mise tool config; installs the release binary via the `ubi` backend (or `cargo:` from source). |
-| `aqua/registry.yaml` | aqua-registry package definition (consumed by `mise use aqua:jrf/rift` and the aqua CLI). |
 
 ## Release process
 

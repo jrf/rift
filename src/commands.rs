@@ -146,13 +146,21 @@ pub fn cmd_label_set(name: &str, pairs: &[String]) -> i32 {
         eprintln!("error: set requires at least one key=value label");
         return 1;
     }
-    for pair in pairs {
+    let expanded: Vec<&str> = pairs
+        .iter()
+        .flat_map(|group| group.split_whitespace())
+        .collect();
+    if expanded.is_empty() {
+        eprintln!("error: set requires at least one key=value label");
+        return 1;
+    }
+    for pair in &expanded {
         if let Err(error) = label::parse_pair(pair) {
             eprintln!("error: {error}");
             return 1;
         }
     }
-    let payload = pairs.join(" ");
+    let payload = expanded.join(" ");
     match label_request(name, Tag::LabelSet, payload.as_bytes(), Tag::Ack) {
         Ok(_) => 0,
         Err(error) => {
@@ -354,7 +362,7 @@ pub fn cmd_detach(name: &str) -> i32 {
 // history
 // ---------------------------------------------------------------------------
 
-pub fn cmd_history(name: &str, format: util::HistoryFormat) -> i32 {
+pub fn cmd_history(name: &str, format: ipc::HistoryFormat) -> i32 {
     let data = match fetch_history(name, format) {
         Ok(data) => data,
         Err(error) => {
@@ -368,11 +376,10 @@ pub fn cmd_history(name: &str, format: util::HistoryFormat) -> i32 {
     0
 }
 
-fn fetch_history(name: &str, format: util::HistoryFormat) -> Result<Vec<u8>, String> {
+fn fetch_history(name: &str, format: ipc::HistoryFormat) -> Result<Vec<u8>, String> {
     let fd = util::session_connect_by_name(name).map_err(|error| error.to_string())?;
 
-    let format_byte = format as u8;
-    ipc::send(fd.as_raw_fd(), Tag::History, &[format_byte])
+    ipc::send(fd.as_raw_fd(), Tag::History, &format.encode())
         .map_err(|error| format!("failed to send history request: {}", error))?;
 
     daemon::ignore_signal(Signal::SIGPIPE);
@@ -408,7 +415,7 @@ fn report_failed_task(session: &util::SessionEntry) {
     let exit_code = session.task_exit_code.unwrap_or(1);
     eprintln!("failed task={} exit_status={}", session.name, exit_code);
 
-    match fetch_history(&session.name, util::HistoryFormat::Plain) {
+    match fetch_history(&session.name, ipc::HistoryFormat::Plain) {
         Ok(history) => {
             let text = String::from_utf8_lossy(&history);
             let lines: Vec<&str> = text.lines().collect();
@@ -774,9 +781,7 @@ pub fn cmd_print(name: &str, text_args: &[String]) -> i32 {
         }
         buf
     } else {
-        let mut s = text_args.join(" ");
-        s.push('\n');
-        s.into_bytes()
+        text_args.join(" ").into_bytes()
     };
 
     if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::Print, &data) {
@@ -807,16 +812,15 @@ pub fn cmd_write(name: &str, path: &str) -> i32 {
         return 1;
     }
 
-    if stdin_data.is_empty() {
-        eprintln!("error: no data on stdin");
-        return 1;
-    }
-
     use base64::Engine;
     let engine = base64::engine::general_purpose::STANDARD;
 
     const CHUNK_SIZE: usize = 48 * 1024;
-    let chunks: Vec<&[u8]> = stdin_data.chunks(CHUNK_SIZE).collect();
+    let chunks: Vec<&[u8]> = if stdin_data.is_empty() {
+        vec![&[]]
+    } else {
+        stdin_data.chunks(CHUNK_SIZE).collect()
+    };
 
     for (i, chunk) in chunks.iter().enumerate() {
         let encoded = engine.encode(chunk);
@@ -880,6 +884,10 @@ pub fn cmd_tail(names: &[String]) -> i32 {
         };
         match socket::session_connect(path_str) {
             Ok(fd) => {
+                if let Err(error) = ipc::send(fd.as_raw_fd(), Tag::Tail, &[]) {
+                    eprintln!("error: cannot subscribe to session '{}': {}", name, error);
+                    continue;
+                }
                 fds.push(fd);
                 bufs.push(SocketBuffer::new());
             }
