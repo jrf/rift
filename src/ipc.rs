@@ -483,32 +483,39 @@ impl SocketBuffer {
         Ok(n)
     }
 
-    /// Returns the next complete message or None.
-    /// The returned slice borrows from the buffer; convert with `.to_vec()`
-    /// if you need to release the borrow before the next iteration.
-    pub fn next(&mut self) -> Option<(Tag, &[u8])> {
+    /// Returns the next complete message, `None` when more bytes are needed,
+    /// or `InvalidData` for malformed input. The returned slice borrows from
+    /// the buffer; convert with `.to_vec()` before reading into it again.
+    pub fn next(&mut self) -> io::Result<Option<(Tag, &[u8])>> {
         let available = &self.buf[self.head..];
         if available.len() < HEADER_SIZE {
-            return None;
+            return Ok(None);
         }
 
         let (tag_byte, len) = decode_header(available);
-        let total = HEADER_SIZE + len as usize;
-        if len as usize > MAX_FRAME_SIZE {
-            self.buf.clear();
-            self.head = 0;
-            return None;
+        let len = len as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame exceeds maximum size",
+            ));
         }
+        let tag = Tag::from_u8(tag_byte).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown protocol tag: {tag_byte}"),
+            )
+        })?;
+        let total = HEADER_SIZE + len;
         if available.len() < total {
-            return None;
+            return Ok(None);
         }
 
-        let tag = Tag::from_u8(tag_byte);
         let start = self.head + HEADER_SIZE;
         let end = self.head + total;
         self.head += total;
 
-        tag.map(|t| (t, &self.buf[start..end]))
+        Ok(Some((tag, &self.buf[start..end])))
     }
 }
 
@@ -592,7 +599,10 @@ pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
             };
         }
 
-        while let Some((tag, payload)) = sb.next() {
+        while let Some((tag, payload)) = sb
+            .next()
+            .map_err(|error| ProbeError::Unexpected(error.to_string()))?
+        {
             match tag {
                 Tag::Info => {
                     info = Info::decode(payload);
@@ -644,7 +654,10 @@ pub fn request_response(
         if read == 0 {
             return Err(ProbeError::Unexpected("connection closed".into()));
         }
-        while let Some((tag, response)) = buffer.next() {
+        while let Some((tag, response)) = buffer
+            .next()
+            .map_err(|error| ProbeError::Unexpected(error.to_string()))?
+        {
             if tag == response_tag {
                 return Ok(response.to_vec());
             }
@@ -911,6 +924,52 @@ mod tests {
         );
         assert_eq!(decode_switch(b"\n/tmp"), None);
         assert_eq!(decode_switch(&[0xff]), None);
+    }
+
+    #[test]
+    fn socket_buffer_rejects_unknown_and_oversized_frames() {
+        let mut unknown = SocketBuffer {
+            buf: {
+                let mut bytes = Vec::new();
+                bytes.push(13);
+                bytes.extend_from_slice(&0u32.to_le_bytes());
+                bytes.extend_from_slice(&encode_header(Tag::Input, 4));
+                bytes.extend_from_slice(b"next");
+                bytes
+            },
+            head: 0,
+        };
+        let error = unknown.next().expect_err("unknown tag must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut oversized = SocketBuffer {
+            buf: {
+                let mut bytes = Vec::new();
+                bytes.push(Tag::Input as u8);
+                bytes.extend_from_slice(&((MAX_FRAME_SIZE as u32) + 1).to_le_bytes());
+                bytes
+            },
+            head: 0,
+        };
+        let error = oversized
+            .next()
+            .expect_err("oversized frame must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn socket_buffer_distinguishes_partial_and_complete_frames() {
+        let mut buffer = SocketBuffer {
+            buf: encode_header(Tag::Output, 5).to_vec(),
+            head: 0,
+        };
+        assert!(buffer.next().unwrap().is_none());
+        buffer.buf.extend_from_slice(b"hello");
+        assert_eq!(
+            buffer.next().unwrap(),
+            Some((Tag::Output, b"hello".as_slice()))
+        );
+        assert!(buffer.next().unwrap().is_none());
     }
 
     #[test]

@@ -159,6 +159,44 @@ fn resize_payload(rows: u16, cols: u16) -> [u8; 4] {
     payload
 }
 
+fn assert_socket_closed(stream: &mut UnixStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set socket timeout");
+    let mut byte = [0];
+    assert_eq!(stream.read(&mut byte).expect("read socket EOF"), 0);
+}
+
+#[test]
+fn malformed_clients_are_disconnected_without_stopping_daemon() {
+    let test = RiftTest::new();
+    assert!(test.output(&["new", "malformed-peer"]).status.success());
+    test.wait_for_session("malformed-peer");
+    let socket = test.dir.join("malformed-peer");
+
+    let mut unknown = UnixStream::connect(&socket).expect("connect unknown-tag client");
+    send_frame(&mut unknown, 13, &[]);
+    assert_socket_closed(&mut unknown);
+
+    let mut invalid_request = UnixStream::connect(&socket).expect("connect invalid-request client");
+    send_frame(&mut invalid_request, 3, b"unexpected");
+    assert_socket_closed(&mut invalid_request);
+
+    let mut oversized = UnixStream::connect(&socket).expect("connect oversized-frame client");
+    oversized.write_all(&[0]).expect("write oversized tag");
+    oversized
+        .write_all(&((16 * 1024 * 1024_u32) + 1).to_le_bytes())
+        .expect("write oversized length");
+    assert_socket_closed(&mut oversized);
+
+    let listed = test.output(&["list", "--short"]);
+    assert!(listed.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout).trim(),
+        "malformed-peer"
+    );
+}
+
 #[test]
 fn control_clients_receive_output_only_after_subscribing() {
     let test = RiftTest::new();

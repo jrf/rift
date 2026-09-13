@@ -399,7 +399,10 @@ fn fetch_history(name: &str, format: ipc::HistoryFormat) -> Result<Vec<u8>, Stri
         match socket_buf.read(fd.as_raw_fd()) {
             Ok(0) => return Err("session closed before returning history".to_string()),
             Ok(_) => {
-                while let Some((tag, payload)) = socket_buf.next() {
+                while let Some((tag, payload)) = socket_buf
+                    .next()
+                    .map_err(|error| format!("invalid history response: {error}"))?
+                {
                     if tag == Tag::History {
                         return Ok(payload.to_vec());
                     }
@@ -691,36 +694,42 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
 
         match socket_buf.read(socket_fd.as_raw_fd()) {
             Ok(0) => break,
-            Ok(_) => {
-                while let Some((tag, payload)) = socket_buf.next() {
-                    match tag {
-                        Tag::Output => {
-                            let completions =
-                                util::scan_task_completions(&mut task_scan_carry, payload);
-                            let responses = util::device_attribute_responses(payload);
-                            if !responses.is_empty() {
-                                let _ = ipc::send(socket_fd.as_raw_fd(), Tag::Input, &responses);
-                            }
-                            let _ = ipc::write_all(stdout_fd, payload);
-                            if let Some((_, exit_code)) = completions
-                                .into_iter()
-                                .find(|(completed_id, _)| *completed_id == request_id)
-                            {
-                                return exit_code as i32;
-                            }
-                        }
-                        Tag::TaskComplete => {
-                            if let Some((completed_id, exit_code)) =
-                                ipc::decode_task_complete(payload)
-                                && completed_id == request_id
-                            {
-                                return exit_code as i32;
-                            }
-                        }
-                        _ => {}
+            Ok(_) => loop {
+                let frame = match socket_buf.next() {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(error) => {
+                        eprintln!("error: invalid session response: {error}");
+                        return 1;
                     }
+                };
+                let (tag, payload) = frame;
+                match tag {
+                    Tag::Output => {
+                        let completions =
+                            util::scan_task_completions(&mut task_scan_carry, payload);
+                        let responses = util::device_attribute_responses(payload);
+                        if !responses.is_empty() {
+                            let _ = ipc::send(socket_fd.as_raw_fd(), Tag::Input, &responses);
+                        }
+                        let _ = ipc::write_all(stdout_fd, payload);
+                        if let Some((_, exit_code)) = completions
+                            .into_iter()
+                            .find(|(completed_id, _)| *completed_id == request_id)
+                        {
+                            return exit_code as i32;
+                        }
+                    }
+                    Tag::TaskComplete => {
+                        if let Some((completed_id, exit_code)) = ipc::decode_task_complete(payload)
+                            && completed_id == request_id
+                        {
+                            return exit_code as i32;
+                        }
+                    }
+                    _ => {}
                 }
-            }
+            },
             Err(nix::errno::Errno::EAGAIN) => {}
             Err(_) => break,
         }
@@ -944,14 +953,22 @@ pub fn cmd_tail(names: &[String]) -> i32 {
                 Ok(0) => {
                     closed.push(i);
                 }
-                Ok(_) => {
-                    while let Some((tag, payload)) = bufs[i].next() {
-                        if tag == Tag::Output {
-                            let filtered = util::filter_tail_output(payload);
-                            let _ = ipc::write_all(stdout_fd, &filtered);
+                Ok(_) => loop {
+                    let frame = match bufs[i].next() {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => break,
+                        Err(error) => {
+                            eprintln!("error: invalid session response: {error}");
+                            closed.push(i);
+                            break;
                         }
+                    };
+                    let (tag, payload) = frame;
+                    if tag == Tag::Output {
+                        let filtered = util::filter_tail_output(payload);
+                        let _ = ipc::write_all(stdout_fd, &filtered);
                     }
-                }
+                },
                 Err(nix::errno::Errno::EAGAIN) => {}
                 Err(_) => {
                     closed.push(i);

@@ -4,7 +4,7 @@
 
 ## Next
 - [ ] Finish hardening the IPC boundary — introduce typed daemon events while preserving wire compatibility; stop overloading `Init`/empty `Resize`; and return explicit mutation results such as rename success/failure #refactor
-- [x] Harden client-request IPC decoding — added typed directional `ClientRequest` dispatch with centralized payload/UTF-8 validation, centralized `Switch` encoding/decoding, strict legacy/full resize lengths, malformed-peer disconnects, and explicit `RiftCodec` rejection of unknown and oversized frames #refactor
+- [x] Harden client-request IPC decoding — added typed directional `ClientRequest` dispatch with centralized payload/UTF-8 validation, centralized `Switch` encoding/decoding, strict legacy/full resize lengths, malformed-peer disconnects, and explicit unknown/oversized-frame errors from both async `RiftCodec` and synchronous `SocketBuffer` consumers #refactor
 - [x] Decompose daemon client state — replaced parallel client maps/sets with a deterministic initialization-ordered `ClientRegistry`, co-located per-client environment and role state, added explicit terminal/output-subscriber routing via the frozen `Tail` tag, and prevented transient control sockets from receiving unsolicited PTY output #refactor
 - [ ] Encapsulate PTY and shutdown lifecycle — add an owning `Pty` with a bounded typed input queue, resize/signaling/reaping APIs, and an explicit graceful/forced shutdown state machine with supervised client draining and race-safe session-path ownership #refactor
 - [ ] Split `src/daemon/server.rs` by responsibility after the registry and PTY seams exist: process/daemonization, PTY I/O, socket connections, client registry, session request handling, and runtime orchestration #refactor
