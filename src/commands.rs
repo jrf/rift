@@ -800,6 +800,66 @@ pub fn cmd_print(name: &str, text_args: &[String]) -> i32 {
 // write
 // ---------------------------------------------------------------------------
 
+fn write_chunk_command(path: &str, encoded: &str, append: bool, request_id: u64) -> String {
+    let redirect = if append { ">>" } else { ">" };
+    // Execute through POSIX sh even when the session's interactive shell is
+    // fish. This gives us a portable exit-status variable while shell_quote
+    // keeps both the destination path and nested script intact.
+    let script = format!(
+        "printf '%s' '{}' | base64 -d {} {}; __rift_status=$?; printf '\\nRIFT_TASK_REQUEST_COMPLETED:{}:%d\\n' \"$__rift_status\"",
+        encoded,
+        redirect,
+        util::shell_quote(path),
+        request_id
+    );
+    format!("sh -c {}\n", util::shell_quote(&script))
+}
+
+fn wait_for_task_completion(
+    fd: RawFd,
+    request_id: u64,
+    socket_buf: &mut SocketBuffer,
+    task_scan_carry: &mut Vec<u8>,
+) -> Result<u8, String> {
+    loop {
+        while let Some(event) = socket_buf
+            .next_daemon_event()
+            .map_err(|error| format!("invalid session response: {error}"))?
+        {
+            match event {
+                ipc::DaemonEvent::TaskComplete {
+                    request_id: completed_id,
+                    exit_code,
+                } if completed_id == request_id => return Ok(exit_code),
+                ipc::DaemonEvent::Output(payload) => {
+                    if let Some((_, exit_code)) =
+                        util::scan_task_completions(task_scan_carry, &payload)
+                            .into_iter()
+                            .find(|(completed_id, _)| *completed_id == request_id)
+                    {
+                        return Ok(exit_code);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let mut poll_fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+        match poll(&mut poll_fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(format!("failed waiting for write: {error}")),
+        }
+
+        match socket_buf.read(fd) {
+            Ok(0) => return Err("session closed before acknowledging write".to_string()),
+            Ok(_) | Err(nix::errno::Errno::EAGAIN) => {}
+            Err(error) => return Err(format!("failed reading write acknowledgement: {error}")),
+        }
+    }
+}
+
 pub fn cmd_write(name: &str, path: &str) -> i32 {
     use std::io::Read;
 
@@ -820,34 +880,44 @@ pub fn cmd_write(name: &str, path: &str) -> i32 {
     use base64::Engine;
     let engine = base64::engine::general_purpose::STANDARD;
 
-    const CHUNK_SIZE: usize = 48 * 1024;
+    // Keep generated commands below common interactive PTY canonical-input
+    // limits. Acknowledging every chunk replaces the former timing throttle.
+    const CHUNK_SIZE: usize = 512;
     let chunks: Vec<&[u8]> = if stdin_data.is_empty() {
         vec![&[]]
     } else {
         stdin_data.chunks(CHUNK_SIZE).collect()
     };
+    let mut socket_buf = SocketBuffer::new();
+    let mut task_scan_carry = Vec::new();
 
-    for (i, chunk) in chunks.iter().enumerate() {
+    for (index, chunk) in chunks.iter().enumerate() {
+        let request_id = next_request_id();
         let encoded = engine.encode(chunk);
-        let cmd = if i == 0 {
-            format!(
-                "printf '{}' | base64 -d > {}\n",
-                encoded,
-                util::shell_quote(path)
-            )
-        } else {
-            format!(
-                "printf '{}' | base64 -d >> {}\n",
-                encoded,
-                util::shell_quote(path)
-            )
-        };
-        if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::Input, cmd.as_bytes()) {
-            eprintln!("error: failed to send chunk: {}", e);
+        let command = write_chunk_command(path, &encoded, index > 0, request_id);
+        if let Err(error) = ipc::send(fd.as_raw_fd(), Tag::RunQuiet, command.as_bytes()) {
+            eprintln!("error: failed to send write chunk: {error}");
             return 1;
         }
-        if i < chunks.len() - 1 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        match wait_for_task_completion(
+            fd.as_raw_fd(),
+            request_id,
+            &mut socket_buf,
+            &mut task_scan_carry,
+        ) {
+            Ok(0) => {}
+            Ok(exit_code) => {
+                eprintln!(
+                    "error: failed to write chunk {} (exit code {})",
+                    index + 1,
+                    exit_code
+                );
+                return 1;
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 1;
+            }
         }
     }
 

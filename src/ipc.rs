@@ -43,6 +43,9 @@ pub enum Tag {
     ResizeRequest = 26,
     /// Result of a session rename; empty means success, UTF-8 text is an error.
     RenameResult = 27,
+    /// Queue a shell command and report its task marker without subscribing the
+    /// requester to echoed PTY output. Used by acknowledged file writes.
+    RunQuiet = 28,
 }
 
 impl Tag {
@@ -75,6 +78,7 @@ impl Tag {
             25 => Some(Tag::TerminalState),
             26 => Some(Tag::ResizeRequest),
             27 => Some(Tag::RenameResult),
+            28 => Some(Tag::RunQuiet),
             _ => None,
         }
     }
@@ -124,6 +128,7 @@ pub enum ClientRequest {
     AttachTerminal(Resize),
     History(HistoryFormat),
     Run(Bytes),
+    RunQuiet(Bytes),
     Switch(String),
     SubscribeOutput,
     Print(Bytes),
@@ -185,6 +190,8 @@ impl ClientRequest {
             ),
             Tag::Run if !payload.is_empty() => Self::Run(payload),
             Tag::Run => return Err(invalid_payload(tag, "expected a non-empty payload")),
+            Tag::RunQuiet if !payload.is_empty() => Self::RunQuiet(payload),
+            Tag::RunQuiet => return Err(invalid_payload(tag, "expected a non-empty payload")),
             Tag::Switch => Self::Switch(utf8(tag, &payload, false)?),
             Tag::Tail => {
                 require_empty(tag, &payload)?;
@@ -346,7 +353,8 @@ impl DaemonEvent {
             | Tag::LabelSet
             | Tag::LabelClear
             | Tag::EnvSet
-            | Tag::EnvGet => {
+            | Tag::EnvGet
+            | Tag::RunQuiet => {
                 return Err(invalid_payload(tag, "tag is not a daemon event"));
             }
         };
@@ -942,6 +950,7 @@ mod tests {
             (Tag::TerminalState, 25),
             (Tag::ResizeRequest, 26),
             (Tag::RenameResult, 27),
+            (Tag::RunQuiet, 28),
         ];
         for (tag, expected) in tags {
             assert_eq!(tag as u8, expected);
@@ -1064,6 +1073,11 @@ mod tests {
         assert!(ClientRequest::decode(Tag::History, Bytes::from_static(&[3])).is_err());
         assert!(ClientRequest::decode(Tag::Detach, Bytes::from_static(b"unexpected")).is_err());
         assert!(ClientRequest::decode(Tag::Run, Bytes::new()).is_err());
+        assert_eq!(
+            ClientRequest::decode(Tag::RunQuiet, Bytes::from_static(b"command")).unwrap(),
+            ClientRequest::RunQuiet(Bytes::from_static(b"command"))
+        );
+        assert!(ClientRequest::decode(Tag::RunQuiet, Bytes::new()).is_err());
         assert!(ClientRequest::decode(Tag::Rename, Bytes::new()).is_err());
         assert!(ClientRequest::decode(Tag::Rename, Bytes::from_static(&[0xff])).is_err());
         assert!(ClientRequest::decode(Tag::Output, Bytes::new()).is_err());

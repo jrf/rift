@@ -868,6 +868,64 @@ fn detached_run_uses_sane_size_without_a_terminal() {
 }
 
 #[test]
+fn multi_chunk_write_waits_for_each_chunk_and_preserves_bytes() {
+    let test = RiftTest::new();
+    assert!(test.output(&["new", "large-write"]).status.success());
+    test.wait_for_session("large-write");
+    let path = test.dir.join("large.bin");
+    let input: Vec<u8> = (0..(5 * 512 + 137))
+        .map(|index| ((index * 31 + 17) % 256) as u8)
+        .collect();
+    let mut child = test
+        .command()
+        .args(["write", "large-write", path.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn multi-chunk write");
+    child
+        .stdin
+        .take()
+        .expect("write stdin")
+        .write_all(&input)
+        .expect("send write contents");
+    let output = child.wait_with_output().expect("wait multi-chunk write");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(path).expect("read multi-chunk file"), input);
+}
+
+#[test]
+fn write_reports_shell_failures() {
+    let test = RiftTest::new();
+    assert!(test.output(&["new", "failed-write"]).status.success());
+    test.wait_for_session("failed-write");
+    let missing_parent = test.dir.join("missing").join("file.txt");
+    let mut child = test
+        .command()
+        .args(["write", "failed-write", missing_parent.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn failed write");
+    child
+        .stdin
+        .take()
+        .expect("write stdin")
+        .write_all(b"contents")
+        .expect("send write contents");
+    let output = child.wait_with_output().expect("wait failed write");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to write chunk 1"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn empty_write_creates_an_empty_file() {
     let test = RiftTest::new();
     assert!(test.output(&["new", "empty-write"]).status.success());

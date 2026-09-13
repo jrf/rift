@@ -503,6 +503,25 @@ impl DaemonState {
         true
     }
 
+    fn queue_run(&mut self, id: ClientId, payload: &[u8]) {
+        let request_id = util::task_request_id(payload);
+        if let Some(request_id) = request_id {
+            self.pending_runs.insert(request_id, id);
+        }
+        if !self.queue_pty_input(payload)
+            && let Some(request_id) = request_id
+        {
+            self.pending_runs.remove(&request_id);
+            self.send_to(
+                id,
+                ipc::DaemonEvent::TaskComplete {
+                    request_id,
+                    exit_code: 255,
+                },
+            );
+        }
+    }
+
     fn apply_resize(&mut self, resize: ipc::Resize) {
         self.parser.set_size(resize.rows, resize.cols);
         let ws = libc::winsize {
@@ -792,23 +811,9 @@ impl DaemonState {
             ClientRequest::SubscribeOutput => self.clients.subscribe_tail(id),
             ClientRequest::Run(payload) => {
                 self.clients.subscribe_tail(id);
-                let request_id = util::task_request_id(&payload);
-                if let Some(request_id) = request_id {
-                    self.pending_runs.insert(request_id, id);
-                }
-                if !self.queue_pty_input(&payload)
-                    && let Some(request_id) = request_id
-                {
-                    self.pending_runs.remove(&request_id);
-                    self.send_to(
-                        id,
-                        ipc::DaemonEvent::TaskComplete {
-                            request_id,
-                            exit_code: 255,
-                        },
-                    );
-                }
+                self.queue_run(id, &payload);
             }
+            ClientRequest::RunQuiet(payload) => self.queue_run(id, &payload),
             ClientRequest::SshAuthSock(path) => {
                 socket::update_ssh_auth_sock_symlink(&self.socket_dir, &self.session_name, &path);
             }
