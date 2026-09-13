@@ -709,9 +709,13 @@ impl DaemonState {
                     // serializing, then resize the real PTY and force WINCH.
                     self.parser.set_size(r.rows, r.cols);
                 }
+                // The client resets all local terminal modes before sending Init.
+                // Replay whenever output predates this client's initialization,
+                // including the very first attachment. Otherwise a program that
+                // already enabled alternate-screen or mouse tracking keeps those
+                // modes in the daemon model but loses them on the real terminal.
                 if first_init
                     && self.has_pty_output
-                    && self.has_had_terminal_client
                     && let Some(state) = self.parser.serialize_state()
                 {
                     let state = util::rewrite_prompt_redraw(&state).unwrap_or(state);

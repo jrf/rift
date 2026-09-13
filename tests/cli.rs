@@ -466,14 +466,14 @@ fn keyboard_input_transfers_resize_ownership_between_clients() {
 }
 
 #[test]
-fn reattach_restores_active_alternate_screen_mode() {
+fn first_attach_restores_preexisting_terminal_modes() {
     let test = RiftTest::new();
     let create = test.output(&[
         "new",
         "alternate-screen",
         "sh",
         "-c",
-        "printf '\\033[?1049h\\033[2J\\033[3;10HALT_MARK'; sleep 30",
+        "printf '\\033[?1049h\\033[?1002h\\033[?1006h\\033[2J\\033[3;10HALT_MARK'; sleep 30",
     ]);
     assert!(
         create.status.success(),
@@ -496,14 +496,10 @@ fn reattach_restores_active_alternate_screen_mode() {
     }
 
     let socket = test.dir.join("alternate-screen");
-    // First attachment establishes that subsequent terminal clients are
-    // reattachments. Initial clients receive live output rather than replay.
-    let mut initial = UnixStream::connect(&socket).expect("connect initial client");
-    send_frame(&mut initial, 7, &resize_payload(24, 80));
-    drop(initial);
-    std::thread::sleep(Duration::from_millis(200));
-
-    let mut client = UnixStream::connect(&socket).expect("connect reattaching client");
+    // This is the first terminal attachment. The child emitted its terminal
+    // modes while the session was headless, so the Init replay must restore
+    // them after the client-side terminal reset.
+    let mut client = UnixStream::connect(&socket).expect("connect first client");
     client
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
@@ -526,6 +522,18 @@ fn reattach_restores_active_alternate_screen_mode() {
             .windows(b"ALT_MARK".len())
             .any(|window| window == b"ALT_MARK"),
         "Init frame did not contain alternate-screen contents"
+    );
+    assert!(
+        payload
+            .windows(b"\x1b[?1002h".len())
+            .any(|window| window == b"\x1b[?1002h"),
+        "Init frame did not restore button-event mouse tracking"
+    );
+    assert!(
+        payload
+            .windows(b"\x1b[?1006h".len())
+            .any(|window| window == b"\x1b[?1006h"),
+        "Init frame did not restore SGR mouse encoding"
     );
 }
 
