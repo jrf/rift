@@ -39,6 +39,110 @@ impl alacritty_terminal::grid::Dimensions for Size {
 /// Scrollback capacity, aligned with current zmx/ghostty defaults.
 const SCROLLBACK: usize = 10_000;
 
+const OSC7_PREFIX: &[u8] = b"\x1b]7;";
+/// Bound incomplete OSC 7 reports so a malformed stream cannot grow state
+/// indefinitely while waiting for BEL or ST.
+const MAX_OSC7_URI_LEN: usize = 8 * 1024;
+
+#[derive(Default)]
+struct Osc7Tracker {
+    state: Osc7State,
+}
+
+#[derive(Default)]
+enum Osc7State {
+    #[default]
+    Seeking,
+    Prefix(usize),
+    Uri {
+        bytes: Vec<u8>,
+        pending_escape: bool,
+    },
+}
+
+impl Osc7Tracker {
+    /// Consume another piece of the PTY stream and return the latest complete,
+    /// valid OSC 7 URI observed in it. Parser state survives read boundaries.
+    fn advance(&mut self, data: &[u8]) -> Option<String> {
+        let mut latest = None;
+        for &byte in data {
+            self.advance_byte(byte, &mut latest);
+        }
+        latest
+    }
+
+    fn advance_byte(&mut self, byte: u8, latest: &mut Option<String>) {
+        match &mut self.state {
+            Osc7State::Seeking => {
+                if byte == OSC7_PREFIX[0] {
+                    self.state = Osc7State::Prefix(1);
+                }
+            }
+            Osc7State::Prefix(matched) => {
+                if byte == OSC7_PREFIX[*matched] {
+                    *matched += 1;
+                    if *matched == OSC7_PREFIX.len() {
+                        self.state = Osc7State::Uri {
+                            bytes: Vec::new(),
+                            pending_escape: false,
+                        };
+                    }
+                } else if byte == OSC7_PREFIX[0] {
+                    *matched = 1;
+                } else {
+                    self.state = Osc7State::Seeking;
+                }
+            }
+            Osc7State::Uri {
+                bytes,
+                pending_escape,
+            } => {
+                if *pending_escape {
+                    if byte == b'\\' {
+                        Self::finish_uri(bytes, latest);
+                        self.state = Osc7State::Seeking;
+                        return;
+                    }
+                    if byte == b']' {
+                        // A new OSC cancels an unterminated predecessor. We
+                        // have already matched ESC ], so continue matching 7;.
+                        self.state = Osc7State::Prefix(2);
+                        return;
+                    }
+                    bytes.push(0x1b);
+                    *pending_escape = false;
+                }
+
+                match byte {
+                    0x07 => {
+                        Self::finish_uri(bytes, latest);
+                        self.state = Osc7State::Seeking;
+                    }
+                    0x1b => *pending_escape = true,
+                    _ => bytes.push(byte),
+                }
+
+                if matches!(&self.state, Osc7State::Uri { bytes, .. } if bytes.len() > MAX_OSC7_URI_LEN)
+                {
+                    self.state = if byte == OSC7_PREFIX[0] {
+                        Osc7State::Prefix(1)
+                    } else {
+                        Osc7State::Seeking
+                    };
+                }
+            }
+        }
+    }
+
+    fn finish_uri(bytes: &[u8], latest: &mut Option<String>) {
+        if let Ok(uri) = std::str::from_utf8(bytes)
+            && uri.starts_with("file://")
+        {
+            *latest = Some(uri.to_string());
+        }
+    }
+}
+
 /// Shared window title, updated by the terminal's OSC 0/2 handling.
 ///
 /// alacritty reports title changes via the `EventListener`; we capture the
@@ -65,6 +169,7 @@ pub struct TermState {
     title: Rc<RefCell<Option<String>>>,
     /// Working directory reported via OSC 7 (`file://host/path`), if any.
     cwd: Option<String>,
+    osc7: Osc7Tracker,
 }
 
 impl TermState {
@@ -84,14 +189,15 @@ impl TermState {
             term: Term::new(config, &size, listener),
             title,
             cwd: None,
+            osc7: Osc7Tracker::default(),
         }
     }
 
     /// Feed raw PTY bytes into the terminal model.
     pub fn process(&mut self, data: &[u8]) {
-        // vte 0.14 does not surface OSC 7 (current working directory), so scan
-        // the stream for it ourselves before handing bytes to the parser.
-        if let Some(cwd) = scan_osc7_cwd(data) {
+        // vte 0.14 does not surface OSC 7 (current working directory), so track
+        // it ourselves before handing the same bytes to the parser.
+        if let Some(cwd) = self.osc7.advance(data) {
             self.cwd = Some(cwd);
         }
         self.parser.advance(&mut self.term, data);
@@ -387,39 +493,6 @@ impl TermState {
         html.push_str("</pre>");
         html.into_bytes()
     }
-}
-
-/// Scan a byte stream for the most recent OSC 7 working-directory report and
-/// return the decoded path. OSC 7 has the form
-/// `ESC ] 7 ; file://host/path ST` (ST = BEL or `ESC \`).
-fn scan_osc7_cwd(data: &[u8]) -> Option<String> {
-    const PREFIX: &[u8] = b"\x1b]7;";
-    let mut result = None;
-    let mut search_from = 0;
-    while let Some(rel) = data[search_from..]
-        .windows(PREFIX.len())
-        .position(|w| w == PREFIX)
-    {
-        let body_start = search_from + rel + PREFIX.len();
-        // Find the OSC terminator: BEL (0x07) or ST (ESC \).
-        let mut end = body_start;
-        while end < data.len() {
-            if data[end] == 0x07 {
-                break;
-            }
-            if data[end] == 0x1b && data.get(end + 1) == Some(&b'\\') {
-                break;
-            }
-            end += 1;
-        }
-        if let Ok(uri) = std::str::from_utf8(&data[body_start..end])
-            && uri.starts_with("file://")
-        {
-            result = Some(uri.to_string());
-        }
-        search_from = end.max(body_start);
-    }
-    result
 }
 
 /// Return a decoded path only when an OSC 7 URI identifies this machine.
@@ -877,6 +950,59 @@ mod tests {
             Some("file://localhost/home/user/proj")
         );
         assert_eq!(dest.cwd().as_deref(), Some("/home/user/proj"));
+    }
+
+    #[test]
+    fn osc7_tracks_sequence_split_at_every_byte_boundary() {
+        let sequence = b"noise\x1b]7;file://localhost/home/user/split\x1b\\prompt";
+        for split in 0..=sequence.len() {
+            let mut state = TermState::new(24, 80);
+            state.process(&sequence[..split]);
+            state.process(&sequence[split..]);
+            assert_eq!(
+                state.cwd_uri().as_deref(),
+                Some("file://localhost/home/user/split"),
+                "split at byte {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc7_waits_for_a_terminator() {
+        let mut state = TermState::new(24, 80);
+        state.process(b"\x1b]7;file://localhost/tmp/incomplete");
+        assert_eq!(state.cwd_uri(), None);
+
+        state.process(b"\x07");
+        assert_eq!(
+            state.cwd_uri().as_deref(),
+            Some("file://localhost/tmp/incomplete")
+        );
+    }
+
+    #[test]
+    fn osc7_new_sequence_recovers_from_unterminated_report() {
+        let mut state = TermState::new(24, 80);
+        state.process(b"\x1b]7;file://localhost/tmp/incomplete");
+        state.process(b"\x1b]7;file://localhost/tmp/replacement\x07");
+        assert_eq!(
+            state.cwd_uri().as_deref(),
+            Some("file://localhost/tmp/replacement")
+        );
+    }
+
+    #[test]
+    fn osc7_discards_oversized_incomplete_reports_and_recovers() {
+        let mut state = TermState::new(24, 80);
+        state.process(b"\x1b]7;file://localhost/");
+        state.process(&vec![b'x'; MAX_OSC7_URI_LEN]);
+        assert_eq!(state.cwd_uri(), None);
+
+        state.process(b"\x1b]7;file://localhost/tmp/recovered\x07");
+        assert_eq!(
+            state.cwd_uri().as_deref(),
+            Some("file://localhost/tmp/recovered")
+        );
     }
 
     #[test]

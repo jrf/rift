@@ -99,18 +99,53 @@ impl Drop for RawModeGuard {
     }
 }
 
-struct NonBlockGuard {
+/// Restores a borrowed descriptor's status and descriptor flags exactly as
+/// they were before the client made it non-blocking and close-on-exec.
+///
+/// Construction is transactional: if either mutation fails, the already-made
+/// changes are rolled back when the partially constructed guard is dropped.
+struct FdFlagsGuard {
     fd: RawFd,
+    status_flags: nix::fcntl::OFlag,
+    descriptor_flags: nix::fcntl::FdFlag,
 }
 
-impl Drop for NonBlockGuard {
+impl FdFlagsGuard {
+    fn set_nonblock_and_cloexec(fd: RawFd) -> io::Result<Self> {
+        use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+
+        let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let status_flags = fcntl(bfd, FcntlArg::F_GETFL)
+            .map(OFlag::from_bits_truncate)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        let descriptor_flags = fcntl(bfd, FcntlArg::F_GETFD)
+            .map(FdFlag::from_bits_truncate)
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        let guard = Self {
+            fd,
+            status_flags,
+            descriptor_flags,
+        };
+
+        fcntl(bfd, FcntlArg::F_SETFL(status_flags | OFlag::O_NONBLOCK))
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        fcntl(
+            bfd,
+            FcntlArg::F_SETFD(descriptor_flags | FdFlag::FD_CLOEXEC),
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+
+        Ok(guard)
+    }
+}
+
+impl Drop for FdFlagsGuard {
     fn drop(&mut self) {
-        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        use nix::fcntl::{FcntlArg, fcntl};
+
         let bfd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        if let Ok(fl) = fcntl(bfd, FcntlArg::F_GETFL) {
-            let fl = OFlag::from_bits_truncate(fl) & !OFlag::O_NONBLOCK;
-            let _ = fcntl(bfd, FcntlArg::F_SETFL(fl));
-        }
+        let _ = fcntl(bfd, FcntlArg::F_SETFL(self.status_flags));
+        let _ = fcntl(bfd, FcntlArg::F_SETFD(self.descriptor_flags));
     }
 }
 
@@ -195,18 +230,26 @@ pub fn run_client_outcome(socket: OwnedFd) -> (i32, ClientOutcome) {
     let stdin_fd: RawFd = 0;
     let stdout_fd: RawFd = 1;
 
-    for (fd, name) in [
-        (socket_fd, "socket"),
-        (stdout_fd, "stdout"),
-        (stdin_fd, "stdin"),
-    ] {
-        if let Err(e) = socket::set_nonblock_and_cloexec(fd) {
-            eprintln!("error: failed to set {} nonblock: {}", name, e);
+    // The socket is owned by this function and will be closed on any failure,
+    // so only borrowed stdio descriptors need restoration guards.
+    if let Err(e) = socket::set_nonblock_and_cloexec(socket_fd) {
+        eprintln!("error: failed to set socket nonblock: {}", e);
+        return (1, ClientOutcome::Detached);
+    }
+    let _stdout_guard = match FdFlagsGuard::set_nonblock_and_cloexec(stdout_fd) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("error: failed to set stdout nonblock: {}", e);
             return (1, ClientOutcome::Detached);
         }
-    }
-    let _stdout_guard = NonBlockGuard { fd: stdout_fd };
-    let _stdin_guard = NonBlockGuard { fd: stdin_fd };
+    };
+    let _stdin_guard = match FdFlagsGuard::set_nonblock_and_cloexec(stdin_fd) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("error: failed to set stdin nonblock: {}", e);
+            return (1, ClientOutcome::Detached);
+        }
+    };
 
     let saved = match enter_raw_mode(stdin_fd) {
         Ok(s) => s,
@@ -462,7 +505,51 @@ fn write_bytes(fd: RawFd, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::should_detach;
+    use super::{FdFlagsGuard, should_detach};
+    use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+    use nix::unistd::pipe;
+    use std::os::fd::{AsFd, AsRawFd};
+
+    fn flags(fd: impl AsFd) -> (OFlag, FdFlag) {
+        let fd = fd.as_fd();
+        (
+            OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL).expect("status flags")),
+            FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD).expect("descriptor flags")),
+        )
+    }
+
+    #[test]
+    fn fd_flags_guard_restores_exact_original_flags() {
+        let (read_fd, _write_fd) = pipe().expect("pipe");
+        let original = flags(&read_fd);
+
+        {
+            let _guard = FdFlagsGuard::set_nonblock_and_cloexec(read_fd.as_raw_fd())
+                .expect("set nonblock and cloexec");
+            let active = flags(&read_fd);
+            assert!(active.0.contains(OFlag::O_NONBLOCK));
+            assert!(active.1.contains(FdFlag::FD_CLOEXEC));
+        }
+
+        assert_eq!(flags(&read_fd), original);
+    }
+
+    #[test]
+    fn fd_flags_guard_preserves_preexisting_nonblock() {
+        let (read_fd, _write_fd) = pipe().expect("pipe");
+        let fd = read_fd.as_fd();
+        let original = flags(fd);
+        fcntl(fd, FcntlArg::F_SETFL(original.0 | OFlag::O_NONBLOCK)).expect("set nonblock");
+        fcntl(fd, FcntlArg::F_SETFD(original.1 | FdFlag::FD_CLOEXEC)).expect("set cloexec");
+        let expected = flags(fd);
+
+        {
+            let _guard = FdFlagsGuard::set_nonblock_and_cloexec(read_fd.as_raw_fd())
+                .expect("set nonblock and cloexec");
+        }
+
+        assert_eq!(flags(&read_fd), expected);
+    }
 
     #[test]
     fn detach_key_can_be_disabled() {
