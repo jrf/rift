@@ -37,6 +37,12 @@ pub enum Tag {
     EnvSet = 22,
     EnvGet = 23,
     EnvData = 24,
+    /// Serialized terminal replay sent when a terminal reattaches.
+    TerminalState = 25,
+    /// Ask the interactive leader to report its current dimensions.
+    ResizeRequest = 26,
+    /// Result of a session rename; empty means success, UTF-8 text is an error.
+    RenameResult = 27,
 }
 
 impl Tag {
@@ -66,6 +72,9 @@ impl Tag {
             22 => Some(Tag::EnvSet),
             23 => Some(Tag::EnvGet),
             24 => Some(Tag::EnvData),
+            25 => Some(Tag::TerminalState),
+            26 => Some(Tag::ResizeRequest),
+            27 => Some(Tag::RenameResult),
             _ => None,
         }
     }
@@ -202,11 +211,146 @@ impl ClientRequest {
                 require_empty(tag, &payload)?;
                 Self::EnvGet
             }
-            Tag::Output | Tag::TaskComplete | Tag::Ack | Tag::LabelData | Tag::EnvData => {
+            Tag::Output
+            | Tag::TaskComplete
+            | Tag::Ack
+            | Tag::LabelData
+            | Tag::EnvData
+            | Tag::TerminalState
+            | Tag::ResizeRequest
+            | Tag::RenameResult => {
                 return Err(invalid_payload(tag, "tag is not a client request"));
             }
         };
         Ok(request)
+    }
+}
+
+/// Validated daemon-to-client messages. Encoding uses dedicated directional
+/// tags for terminal replay and size requests; decoding also accepts the legacy
+/// overloaded `Init` and empty `Resize` forms for wire compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonEvent {
+    Output(Bytes),
+    TerminalState(Bytes),
+    ResizeRequest,
+    Detach,
+    Info(Info),
+    History(Bytes),
+    TaskComplete { request_id: u64, exit_code: u8 },
+    Switch { name: String, cwd: Option<String> },
+    Ack,
+    LabelData(String),
+    EnvData(String),
+    RenameResult(Result<(), String>),
+}
+
+impl DaemonEvent {
+    pub fn encode(self) -> (Tag, Bytes) {
+        match self {
+            Self::Output(payload) => (Tag::Output, payload),
+            // Keep emitting the legacy tags until protocol capability
+            // negotiation exists; decoding accepts both legacy and dedicated
+            // forms so the semantic API itself is no longer overloaded.
+            Self::TerminalState(payload) => (Tag::Init, payload),
+            Self::ResizeRequest => (Tag::Resize, Bytes::new()),
+            Self::Detach => (Tag::Detach, Bytes::new()),
+            Self::Info(info) => (Tag::Info, Bytes::from(info.encode())),
+            Self::History(payload) => (Tag::History, payload),
+            Self::TaskComplete {
+                request_id,
+                exit_code,
+            } => (
+                Tag::TaskComplete,
+                encode_task_complete(request_id, exit_code),
+            ),
+            Self::Switch { name, cwd } => (Tag::Switch, encode_switch(&name, cwd.as_deref())),
+            Self::Ack => (Tag::Ack, Bytes::new()),
+            Self::LabelData(labels) => (Tag::LabelData, Bytes::from(labels.into_bytes())),
+            Self::EnvData(environment) => (Tag::EnvData, Bytes::from(environment.into_bytes())),
+            Self::RenameResult(result) => (
+                Tag::RenameResult,
+                Bytes::from(result.err().unwrap_or_default().into_bytes()),
+            ),
+        }
+    }
+
+    pub fn decode(tag: Tag, payload: Bytes) -> io::Result<Self> {
+        fn require_empty(tag: Tag, payload: &Bytes) -> io::Result<()> {
+            if payload.is_empty() {
+                Ok(())
+            } else {
+                Err(invalid_payload(tag, "expected an empty payload"))
+            }
+        }
+
+        fn utf8(tag: Tag, payload: &Bytes) -> io::Result<String> {
+            std::str::from_utf8(payload)
+                .map(str::to_string)
+                .map_err(|_| invalid_payload(tag, "expected UTF-8"))
+        }
+
+        let event = match tag {
+            Tag::Output => Self::Output(payload),
+            Tag::TerminalState | Tag::Init => Self::TerminalState(payload),
+            Tag::ResizeRequest => {
+                require_empty(tag, &payload)?;
+                Self::ResizeRequest
+            }
+            Tag::Resize if payload.is_empty() => Self::ResizeRequest,
+            Tag::Resize => return Err(invalid_payload(tag, "expected an empty payload")),
+            Tag::Detach => {
+                require_empty(tag, &payload)?;
+                Self::Detach
+            }
+            Tag::Info => Self::Info(
+                Info::decode(&payload).ok_or_else(|| invalid_payload(tag, "invalid info"))?,
+            ),
+            Tag::History => Self::History(payload),
+            Tag::TaskComplete => {
+                let (request_id, exit_code) = decode_task_complete(&payload)
+                    .ok_or_else(|| invalid_payload(tag, "invalid task completion"))?;
+                Self::TaskComplete {
+                    request_id,
+                    exit_code,
+                }
+            }
+            Tag::Switch => {
+                let (name, cwd) = decode_switch(&payload)
+                    .ok_or_else(|| invalid_payload(tag, "invalid switch target"))?;
+                Self::Switch { name, cwd }
+            }
+            Tag::Ack => {
+                require_empty(tag, &payload)?;
+                Self::Ack
+            }
+            Tag::LabelData => Self::LabelData(utf8(tag, &payload)?),
+            Tag::EnvData => Self::EnvData(utf8(tag, &payload)?),
+            Tag::RenameResult => {
+                let message = utf8(tag, &payload)?;
+                Self::RenameResult(if message.is_empty() {
+                    Ok(())
+                } else {
+                    Err(message)
+                })
+            }
+            Tag::Input
+            | Tag::DetachAll
+            | Tag::Kill
+            | Tag::Run
+            | Tag::Tail
+            | Tag::Print
+            | Tag::SshAuthSock
+            | Tag::Rename
+            | Tag::LabelGet
+            | Tag::LabelSet
+            | Tag::LabelClear
+            | Tag::EnvSet
+            | Tag::EnvGet => {
+                return Err(invalid_payload(tag, "tag is not a daemon event"));
+            }
+        };
+        Ok(event)
     }
 }
 
@@ -299,7 +443,7 @@ impl Resize {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Info {
     pub clients_len: usize,
     pub pid: i32,
@@ -342,7 +486,7 @@ impl Info {
         let task_exit_code = data[28];
         let cmd_len = u16::from_le_bytes(data[29..31].try_into().ok()?) as usize;
         let cwd_len = u16::from_le_bytes(data[31..33].try_into().ok()?) as usize;
-        if data.len() < Self::HEADER_LEN + cmd_len + cwd_len {
+        if data.len() != Self::HEADER_LEN + cmd_len + cwd_len {
             return None;
         }
         let cmd_start = Self::HEADER_LEN;
@@ -517,6 +661,14 @@ impl SocketBuffer {
 
         Ok(Some((tag, &self.buf[start..end])))
     }
+
+    /// Decode the next complete frame as a validated daemon event.
+    pub fn next_daemon_event(&mut self) -> io::Result<Option<DaemonEvent>> {
+        let Some((tag, payload)) = self.next()? else {
+            return Ok(None);
+        };
+        DaemonEvent::decode(tag, Bytes::copy_from_slice(payload)).map(Some)
+    }
 }
 
 #[derive(Debug)]
@@ -599,18 +751,18 @@ pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
             };
         }
 
-        while let Some((tag, payload)) = sb
-            .next()
+        while let Some(event) = sb
+            .next_daemon_event()
             .map_err(|error| ProbeError::Unexpected(error.to_string()))?
         {
-            match tag {
-                Tag::Info => {
-                    info = Info::decode(payload);
-                    if info.is_some() && labels_deadline.is_none() {
+            match event {
+                DaemonEvent::Info(value) => {
+                    info = Some(value);
+                    if labels_deadline.is_none() {
                         labels_deadline = Some(Instant::now() + Duration::from_millis(50));
                     }
                 }
-                Tag::LabelData => labels = Some(payload.to_vec()),
+                DaemonEvent::LabelData(value) => labels = Some(value.into_bytes()),
                 _ => {}
             }
         }
@@ -658,6 +810,8 @@ pub fn request_response(
             .next()
             .map_err(|error| ProbeError::Unexpected(error.to_string()))?
         {
+            DaemonEvent::decode(tag, Bytes::copy_from_slice(response))
+                .map_err(|error| ProbeError::Unexpected(error.to_string()))?;
             if tag == response_tag {
                 return Ok(response.to_vec());
             }
@@ -785,6 +939,9 @@ mod tests {
             (Tag::EnvSet, 22),
             (Tag::EnvGet, 23),
             (Tag::EnvData, 24),
+            (Tag::TerminalState, 25),
+            (Tag::ResizeRequest, 26),
+            (Tag::RenameResult, 27),
         ];
         for (tag, expected) in tags {
             assert_eq!(tag as u8, expected);
@@ -910,6 +1067,46 @@ mod tests {
         assert!(ClientRequest::decode(Tag::Rename, Bytes::new()).is_err());
         assert!(ClientRequest::decode(Tag::Rename, Bytes::from_static(&[0xff])).is_err());
         assert!(ClientRequest::decode(Tag::Output, Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn daemon_events_validate_direction_payloads_and_legacy_forms() {
+        let resize_request = DaemonEvent::ResizeRequest;
+        assert_eq!(resize_request.clone().encode(), (Tag::Resize, Bytes::new()));
+        assert_eq!(
+            DaemonEvent::decode(Tag::Resize, Bytes::new()).unwrap(),
+            resize_request
+        );
+        assert_eq!(
+            DaemonEvent::decode(Tag::ResizeRequest, Bytes::new()).unwrap(),
+            resize_request
+        );
+        assert!(DaemonEvent::decode(Tag::Resize, Bytes::from_static(&[1])).is_err());
+
+        let replay = Bytes::from_static(b"terminal state");
+        assert_eq!(
+            DaemonEvent::TerminalState(replay.clone()).encode(),
+            (Tag::Init, replay.clone())
+        );
+        assert_eq!(
+            DaemonEvent::decode(Tag::Init, replay.clone()).unwrap(),
+            DaemonEvent::TerminalState(replay.clone())
+        );
+        assert_eq!(
+            DaemonEvent::decode(Tag::TerminalState, replay.clone()).unwrap(),
+            DaemonEvent::TerminalState(replay)
+        );
+
+        assert_eq!(
+            DaemonEvent::RenameResult(Ok(())).encode(),
+            (Tag::RenameResult, Bytes::new())
+        );
+        assert_eq!(
+            DaemonEvent::decode(Tag::RenameResult, Bytes::from_static(b"occupied")).unwrap(),
+            DaemonEvent::RenameResult(Err("occupied".to_string()))
+        );
+        assert!(DaemonEvent::decode(Tag::Ack, Bytes::from_static(b"unexpected")).is_err());
+        assert!(DaemonEvent::decode(Tag::Input, Bytes::new()).is_err());
     }
 
     #[test]

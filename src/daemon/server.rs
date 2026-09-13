@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time::{self, Duration, Instant};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use crate::ipc::{self, RiftCodec, Tag};
+use crate::ipc::{self, RiftCodec};
 use crate::label;
 use crate::socket;
 use crate::util;
@@ -205,12 +205,8 @@ enum ClientMsg {
     Gone,
 }
 
-/// Frame queued for delivery to a client task's socket.
-#[derive(Clone)]
-struct DaemonFrame {
-    tag: Tag,
-    payload: Bytes,
-}
+/// Validated event queued for delivery to a client task's socket.
+type DaemonFrame = ipc::DaemonEvent;
 
 type ClientId = u64;
 
@@ -544,13 +540,7 @@ impl DaemonState {
     fn request_leader_size(&mut self, id: ClientId) {
         // Ask for a fresh size. Cached dimensions can be stale when a terminal
         // was resized while it was not the interactive leader.
-        self.send_to(
-            id,
-            DaemonFrame {
-                tag: Tag::Resize,
-                payload: Bytes::new(),
-            },
-        );
+        self.send_to(id, ipc::DaemonEvent::ResizeRequest);
     }
 
     /// Reap the child after SIGCHLD. Sets `child_exited` and records exit
@@ -591,19 +581,16 @@ impl DaemonState {
             if let Some(client_id) = self.pending_runs.remove(&request_id) {
                 self.send_to(
                     client_id,
-                    DaemonFrame {
-                        tag: Tag::TaskComplete,
-                        payload: ipc::encode_task_complete(request_id, code),
+                    ipc::DaemonEvent::TaskComplete {
+                        request_id,
+                        exit_code: code,
                     },
                 );
             }
         }
         let rewritten = util::rewrite_prompt_redraw(data);
         let output = rewritten.as_deref().unwrap_or(data);
-        self.broadcast_output(DaemonFrame {
-            tag: Tag::Output,
-            payload: Bytes::copy_from_slice(output),
-        });
+        self.broadcast_output(ipc::DaemonEvent::Output(Bytes::copy_from_slice(output)));
         !self.clients.has_terminals()
     }
 
@@ -631,23 +618,25 @@ impl DaemonState {
     /// up on exit (existing clients reach the daemon via the old symlink
     /// pointing at the new one). No-op if `new_name` matches the current
     /// name or if the target socket path is already occupied.
-    fn rename_session(&mut self, new_name: &str) {
+    fn rename_session(&mut self, new_name: &str) -> Result<(), String> {
         if new_name == self.session_name {
-            return;
+            return Ok(());
         }
         let old_socket_path = self.socket_dir.join(&self.session_name);
         let new_socket_path = self.socket_dir.join(new_name);
 
         if new_socket_path.exists() {
-            log::error!(
-                "rename failed: target socket path already exists: {}",
+            let message = format!(
+                "target socket path already exists: {}",
                 new_socket_path.display()
             );
-            return;
+            log::error!("rename failed: {}", message);
+            return Err(message);
         }
-        if let Err(e) = std::fs::rename(&old_socket_path, &new_socket_path) {
-            log::error!("rename failed: failed to rename socket: {}", e);
-            return;
+        if let Err(error) = std::fs::rename(&old_socket_path, &new_socket_path) {
+            let message = format!("failed to rename socket: {error}");
+            log::error!("rename failed: {}", message);
+            return Err(message);
         }
         log::info!("session renamed: '{}' -> '{}'", self.session_name, new_name);
 
@@ -687,6 +676,7 @@ impl DaemonState {
 
         self.old_session_names.push(self.session_name.clone());
         self.session_name = new_name.to_string();
+        Ok(())
     }
 
     /// Dispatch a validated protocol request from client `id`.
@@ -725,13 +715,7 @@ impl DaemonState {
                     && let Some(state) = self.parser.serialize_state()
                 {
                     let state = util::rewrite_prompt_redraw(&state).unwrap_or(state);
-                    self.send_to(
-                        id,
-                        DaemonFrame {
-                            tag: Tag::Init,
-                            payload: Bytes::from(state),
-                        },
-                    );
+                    self.send_to(id, ipc::DaemonEvent::TerminalState(Bytes::from(state)));
                 }
                 if is_leader {
                     self.apply_resize(r);
@@ -753,21 +737,12 @@ impl DaemonState {
             }
             ClientRequest::Detach => {
                 log::info!("client requested detach, id={}", id);
-                self.send_to(
-                    id,
-                    DaemonFrame {
-                        tag: Tag::Detach,
-                        payload: Bytes::new(),
-                    },
-                );
+                self.send_to(id, ipc::DaemonEvent::Detach);
                 self.remove_client(id);
             }
             ClientRequest::DetachAll => {
                 log::info!("client requested detach-all");
-                self.broadcast_control(DaemonFrame {
-                    tag: Tag::Detach,
-                    payload: Bytes::new(),
-                });
+                self.broadcast_control(ipc::DaemonEvent::Detach);
                 let had_terminals = self.clients.clear();
                 if had_terminals && self.parser.focus_reporting() {
                     self.queue_pty_input(FOCUS_OUT);
@@ -780,23 +755,10 @@ impl DaemonState {
                 self.shutdown_requested = true;
             }
             ClientRequest::Info => {
-                let payload = Bytes::from(self.build_info().encode());
-                self.send_to(
-                    id,
-                    DaemonFrame {
-                        tag: Tag::Info,
-                        payload,
-                    },
-                );
+                self.send_to(id, ipc::DaemonEvent::Info(self.build_info()));
             }
             ClientRequest::LabelGet => {
-                self.send_to(
-                    id,
-                    DaemonFrame {
-                        tag: Tag::LabelData,
-                        payload: Bytes::from(label::encode(&self.labels)),
-                    },
-                );
+                self.send_to(id, ipc::DaemonEvent::LabelData(label::encode(&self.labels)));
             }
             ClientRequest::LabelSet(pairs) => {
                 for pair in pairs.split_whitespace() {
@@ -809,40 +771,19 @@ impl DaemonState {
                         self.labels.insert(key.to_string(), value.to_string());
                     }
                 }
-                self.send_to(
-                    id,
-                    DaemonFrame {
-                        tag: Tag::Ack,
-                        payload: Bytes::new(),
-                    },
-                );
+                self.send_to(id, ipc::DaemonEvent::Ack);
             }
             ClientRequest::LabelClear => {
                 self.labels.clear();
-                self.send_to(
-                    id,
-                    DaemonFrame {
-                        tag: Tag::Ack,
-                        payload: Bytes::new(),
-                    },
-                );
+                self.send_to(id, ipc::DaemonEvent::Ack);
             }
             ClientRequest::History(format) => {
                 let data = util::serialize_terminal(&self.parser, format).unwrap_or_default();
-                self.send_to(
-                    id,
-                    DaemonFrame {
-                        tag: Tag::History,
-                        payload: Bytes::from(data),
-                    },
-                );
+                self.send_to(id, ipc::DaemonEvent::History(Bytes::from(data)));
             }
             ClientRequest::Print(payload) => {
                 self.parser.process(&payload);
-                self.broadcast_output(DaemonFrame {
-                    tag: Tag::Output,
-                    payload,
-                });
+                self.broadcast_output(ipc::DaemonEvent::Output(payload));
             }
             ClientRequest::SubscribeOutput => self.clients.subscribe_tail(id),
             ClientRequest::Run(payload) => {
@@ -857,9 +798,9 @@ impl DaemonState {
                     self.pending_runs.remove(&request_id);
                     self.send_to(
                         id,
-                        DaemonFrame {
-                            tag: Tag::TaskComplete,
-                            payload: ipc::encode_task_complete(request_id, 255),
+                        ipc::DaemonEvent::TaskComplete {
+                            request_id,
+                            exit_code: 255,
                         },
                     );
                 }
@@ -879,15 +820,12 @@ impl DaemonState {
                     .selected_environment()
                     .unwrap_or_default()
                     .to_string();
-                self.send_to(
-                    id,
-                    DaemonFrame {
-                        tag: Tag::EnvData,
-                        payload: Bytes::from(payload.into_bytes()),
-                    },
-                );
+                self.send_to(id, ipc::DaemonEvent::EnvData(payload));
             }
-            ClientRequest::Rename(new_name) => self.rename_session(&new_name),
+            ClientRequest::Rename(new_name) => {
+                let result = self.rename_session(&new_name);
+                self.send_to(id, ipc::DaemonEvent::RenameResult(result));
+            }
             ClientRequest::Switch(target) => {
                 // A client (typically a transient `rift attach <target>` run
                 // from *inside* the session) wants the interactive user handed
@@ -900,9 +838,9 @@ impl DaemonState {
                     let cwd = self.parser.cwd().unwrap_or_else(|| self.cwd.clone());
                     self.send_to(
                         leader,
-                        DaemonFrame {
-                            tag: Tag::Switch,
-                            payload: ipc::encode_switch(&target, Some(&cwd)),
+                        ipc::DaemonEvent::Switch {
+                            name: target,
+                            cwd: Some(cwd),
                         },
                     );
                     self.remove_client(leader);
@@ -934,7 +872,7 @@ async fn client_task(
 
     let write_join = tokio::task::spawn_local(async move {
         while let Some(frame) = rx.recv().await {
-            if writer.send((frame.tag, frame.payload)).await.is_err() {
+            if writer.send(frame.encode()).await.is_err() {
                 break;
             }
         }
@@ -1164,10 +1102,7 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
     }
 
     // Notify any still-attached clients to detach gracefully.
-    let detach = DaemonFrame {
-        tag: Tag::Detach,
-        payload: Bytes::new(),
-    };
+    let detach = ipc::DaemonEvent::Detach;
     for sender in state.clients.drain_senders() {
         let _ = sender.try_send(detach.clone());
     }

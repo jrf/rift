@@ -198,6 +198,40 @@ fn malformed_clients_are_disconnected_without_stopping_daemon() {
 }
 
 #[test]
+fn rename_waits_for_daemon_result() {
+    let test = RiftTest::new();
+    assert!(test.output(&["new", "rename-source"]).status.success());
+    test.wait_for_session("rename-source");
+
+    let renamed = test.output(&["rename", "rename-source", "rename-success"]);
+    assert!(
+        renamed.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&renamed.stdout),
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    test.wait_for_session("rename-success");
+
+    let target = test.dir.join("rename-occupied");
+    fs::write(&target, b"sentinel").expect("create occupied rename target");
+    let rejected = test.output(&["rename", "rename-success", "rename-occupied"]);
+    assert_eq!(
+        rejected.status.code(),
+        Some(1),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("target socket path already exists"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(fs::read(target).expect("read occupied target"), b"sentinel");
+    test.wait_for_session("rename-success");
+}
+
+#[test]
 fn control_clients_receive_output_only_after_subscribing() {
     let test = RiftTest::new();
     assert!(

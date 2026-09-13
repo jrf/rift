@@ -377,33 +377,33 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
 
             item = reader.next() => {
                 let (tag, payload) = match item {
-                    Some(Ok(f)) => f,
+                    Some(Ok(frame)) => frame,
                     Some(Err(_)) | None => break,
                 };
-                match tag {
-                    Tag::Output | Tag::Init => {
+                let event = match ipc::DaemonEvent::decode(tag, payload) {
+                    Ok(event) => event,
+                    Err(_) => break,
+                };
+                match event {
+                    ipc::DaemonEvent::Output(payload)
+                    | ipc::DaemonEvent::TerminalState(payload) => {
                         if out_buf.len() + payload.len() > MAX_OUT_BUF {
                             let excess = out_buf.len() + payload.len() - MAX_OUT_BUF;
                             out_buf.drain(..excess.min(out_buf.len()));
                         }
                         out_buf.extend_from_slice(&payload);
                     }
-                    Tag::Switch => {
-                        // Daemon is handing us off to another session. Payload is
-                        // `name\ncwd`; the cwd (this session's live dir) is used
-                        // to spawn the target if it doesn't exist yet.
-                        if let Some((name, cwd)) = ipc::decode_switch(&payload) {
-                            outcome = ClientOutcome::Switch { name, cwd };
-                        }
+                    ipc::DaemonEvent::Switch { name, cwd } => {
+                        outcome = ClientOutcome::Switch { name, cwd };
                         break;
                     }
-                    Tag::Resize if payload.is_empty() => {
+                    ipc::DaemonEvent::ResizeRequest => {
                         let size = ipc::get_terminal_size(stdout_fd);
                         let _ = writer
                             .send((Tag::Resize, Bytes::copy_from_slice(&size.encode())))
                             .await;
                     }
-                    Tag::Detach => break,
+                    ipc::DaemonEvent::Detach => break,
                     _ => {}
                 }
             }

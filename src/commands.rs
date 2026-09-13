@@ -399,11 +399,11 @@ fn fetch_history(name: &str, format: ipc::HistoryFormat) -> Result<Vec<u8>, Stri
         match socket_buf.read(fd.as_raw_fd()) {
             Ok(0) => return Err("session closed before returning history".to_string()),
             Ok(_) => {
-                while let Some((tag, payload)) = socket_buf
-                    .next()
+                while let Some(event) = socket_buf
+                    .next_daemon_event()
                     .map_err(|error| format!("invalid history response: {error}"))?
                 {
-                    if tag == Tag::History {
+                    if let ipc::DaemonEvent::History(payload) = event {
                         return Ok(payload.to_vec());
                     }
                 }
@@ -695,24 +695,23 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
         match socket_buf.read(socket_fd.as_raw_fd()) {
             Ok(0) => break,
             Ok(_) => loop {
-                let frame = match socket_buf.next() {
-                    Ok(Some(frame)) => frame,
+                let event = match socket_buf.next_daemon_event() {
+                    Ok(Some(event)) => event,
                     Ok(None) => break,
                     Err(error) => {
                         eprintln!("error: invalid session response: {error}");
                         return 1;
                     }
                 };
-                let (tag, payload) = frame;
-                match tag {
-                    Tag::Output => {
+                match event {
+                    ipc::DaemonEvent::Output(payload) => {
                         let completions =
-                            util::scan_task_completions(&mut task_scan_carry, payload);
-                        let responses = util::device_attribute_responses(payload);
+                            util::scan_task_completions(&mut task_scan_carry, &payload);
+                        let responses = util::device_attribute_responses(&payload);
                         if !responses.is_empty() {
                             let _ = ipc::send(socket_fd.as_raw_fd(), Tag::Input, &responses);
                         }
-                        let _ = ipc::write_all(stdout_fd, payload);
+                        let _ = ipc::write_all(stdout_fd, &payload);
                         if let Some((_, exit_code)) = completions
                             .into_iter()
                             .find(|(completed_id, _)| *completed_id == request_id)
@@ -720,13 +719,10 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
                             return exit_code as i32;
                         }
                     }
-                    Tag::TaskComplete => {
-                        if let Some((completed_id, exit_code)) = ipc::decode_task_complete(payload)
-                            && completed_id == request_id
-                        {
-                            return exit_code as i32;
-                        }
-                    }
+                    ipc::DaemonEvent::TaskComplete {
+                        request_id: completed_id,
+                        exit_code,
+                    } if completed_id == request_id => return exit_code as i32,
                     _ => {}
                 }
             },
@@ -954,8 +950,8 @@ pub fn cmd_tail(names: &[String]) -> i32 {
                     closed.push(i);
                 }
                 Ok(_) => loop {
-                    let frame = match bufs[i].next() {
-                        Ok(Some(frame)) => frame,
+                    let event = match bufs[i].next_daemon_event() {
+                        Ok(Some(event)) => event,
                         Ok(None) => break,
                         Err(error) => {
                             eprintln!("error: invalid session response: {error}");
@@ -963,9 +959,8 @@ pub fn cmd_tail(names: &[String]) -> i32 {
                             break;
                         }
                     };
-                    let (tag, payload) = frame;
-                    if tag == Tag::Output {
-                        let filtered = util::filter_tail_output(payload);
+                    if let ipc::DaemonEvent::Output(payload) = event {
+                        let filtered = util::filter_tail_output(&payload);
                         let _ = ipc::write_all(stdout_fd, &filtered);
                     }
                 },
@@ -1524,18 +1519,26 @@ pub fn cmd_rename(name: &str, new_name: &str) -> i32 {
         return 1;
     }
 
-    let fd = match util::session_connect_by_name(name) {
-        Ok(fd) => fd,
-        Err(e) => {
-            eprintln!("error: {}", e);
+    let payload = match session_request(
+        name,
+        "rename",
+        Tag::Rename,
+        new_session_name.as_bytes(),
+        Tag::RenameResult,
+    ) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("error: {error}");
             return 1;
         }
     };
-
-    if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::Rename, new_session_name.as_bytes()) {
-        eprintln!("error: failed to send rename request: {}", e);
-        return 1;
+    if payload.is_empty() {
+        0
+    } else {
+        eprintln!(
+            "error: rename failed: {}",
+            String::from_utf8_lossy(&payload)
+        );
+        1
     }
-
-    0
 }
