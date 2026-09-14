@@ -853,7 +853,12 @@ fn wait_for_task_completion(
         }
 
         match socket_buf.read(fd) {
-            Ok(0) => return Err("session closed before acknowledging write".to_string()),
+            Ok(0) => {
+                return Err(
+                    "session closed before acknowledging write; if it was created by an older rift version, restart the session and retry"
+                        .to_string(),
+                );
+            }
             Ok(_) | Err(nix::errno::Errno::EAGAIN) => {}
             Err(error) => return Err(format!("failed reading write acknowledgement: {error}")),
         }

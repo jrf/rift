@@ -71,6 +71,11 @@ rift completions <shell>      Print completions (bash, zsh, fish, nu)
 
 All subcommands have short aliases: `a`, `n`, `r`, `s`, `p`, `wr`, `t`, `hi`, `lg`, `la`, `pe`, `d`, `rn`, `k`, `w`, `l`/`ls`, `c`, `v`, `h`. Commands that address the current session accept `.` as shorthand for `$RIFT_SESSION`.
 
+The CLI and each session daemon use the protocol from the `rift` binary that
+started them. After upgrading `rift`, restart older sessions before using newly
+introduced protocol operations; `rift write` reports this case when its
+acknowledgement connection is rejected.
+
 **Detach key:** `Ctrl+\`
 
 ## Examples

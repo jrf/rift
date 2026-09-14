@@ -4,6 +4,7 @@
 
 use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use nix::sys::signal::Signal;
@@ -23,6 +24,11 @@ use super::ignore_signal;
 /// Client-side output buffer cap. Above this, drop oldest bytes rather than
 /// grow unbounded if stdout can't keep up.
 const MAX_OUT_BUF: usize = 4 * 1024 * 1024;
+
+/// Best-effort deadline for flushing already-buffered session output during
+/// detach. Terminal mode restoration must not wait forever on a stalled stdout.
+const FINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const FINAL_DRAIN_RETRY: Duration = Duration::from_millis(1);
 
 /// "Be sane" reset sent on attach and detach: disable all common mouse-tracking
 /// variants (including 1016 SGR-pixel), focus reporting, bracketed paste;
@@ -461,24 +467,10 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
         }
     }
 
-    // Final synchronous drain so any tail bytes reach the terminal before
-    // the runtime tears down (and write_terminal_reset writes over them).
-    // Stdout is still O_NONBLOCK here; on EAGAIN we briefly back off and
-    // retry rather than break — silently dropping the tail can chop an
-    // escape sequence and leave its remainder visible as literal text.
-    let bfd = unsafe { BorrowedFd::borrow_raw(stdout_fd) };
-    while !out_buf.is_empty() {
-        match unistd::write(bfd, &out_buf) {
-            Ok(n) if n > 0 => {
-                out_buf.drain(..n);
-            }
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(nix::errno::Errno::EAGAIN) => {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            _ => break,
-        }
-    }
+    // Best-effort final drain so tail bytes normally reach the terminal before
+    // write_terminal_reset writes over them. A stalled stdout must not delay
+    // terminal-mode restoration indefinitely.
+    drain_bytes(stdout_fd, &mut out_buf, FINAL_DRAIN_TIMEOUT);
 
     outcome
 }
@@ -487,28 +479,40 @@ fn write_terminal_reset(fd: RawFd) {
     write_bytes(fd, TERMINAL_RESET);
 }
 
-/// Blocking write of a fixed byte slice to `fd`, retrying on EAGAIN/EINTR.
-/// Drains the kernel buffer so the bytes reach the terminal before we move
-/// on (e.g. restore termios or exit) — otherwise they can be discarded.
-fn write_bytes(fd: RawFd, bytes: &[u8]) {
+/// Drain mutable buffered output until it is empty, the descriptor fails, or
+/// `timeout` expires. Stdout is nonblocking while the client runs, so bounding
+/// EAGAIN retries keeps detach and raw-mode restoration reliable.
+fn drain_bytes(fd: RawFd, bytes: &mut Vec<u8>, timeout: Duration) {
     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut written = 0;
-    while written < bytes.len() {
-        match unistd::write(bfd, &bytes[written..]) {
-            Ok(n) if n > 0 => written += n,
-            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => continue,
+    let deadline = Instant::now() + timeout;
+    while !bytes.is_empty() && Instant::now() < deadline {
+        match unistd::write(bfd, bytes) {
+            Ok(n) if n > 0 => {
+                bytes.drain(..n);
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EAGAIN) if Instant::now() < deadline => {
+                std::thread::sleep(FINAL_DRAIN_RETRY);
+            }
             _ => break,
         }
     }
-    let _ = termios::tcdrain(bfd);
+}
+
+/// Best-effort write of a fixed terminal-control sequence. These writes share
+/// the final-drain bound so terminal cleanup cannot itself hang on full stdout.
+fn write_bytes(fd: RawFd, bytes: &[u8]) {
+    let mut pending = bytes.to_vec();
+    drain_bytes(fd, &mut pending, FINAL_DRAIN_TIMEOUT);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FdFlagsGuard, should_detach};
+    use super::{FdFlagsGuard, drain_bytes, should_detach};
     use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
-    use nix::unistd::pipe;
+    use nix::unistd::{pipe, write};
     use std::os::fd::{AsFd, AsRawFd};
+    use std::time::{Duration, Instant};
 
     fn flags(fd: impl AsFd) -> (OFlag, FdFlag) {
         let fd = fd.as_fd();
@@ -549,6 +553,34 @@ mod tests {
         }
 
         assert_eq!(flags(&read_fd), expected);
+    }
+
+    #[test]
+    fn final_drain_stops_when_nonblocking_output_stays_full() {
+        let (read_fd, write_fd) = pipe().expect("pipe");
+        let flags =
+            OFlag::from_bits_truncate(fcntl(&write_fd, FcntlArg::F_GETFL).expect("get pipe flags"));
+        fcntl(&write_fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+            .expect("set pipe nonblocking");
+
+        let fill = [0u8; 4096];
+        while write(&write_fd, &fill).is_ok() {}
+
+        let mut pending = b"terminal tail".to_vec();
+        let started = Instant::now();
+        drain_bytes(
+            write_fd.as_raw_fd(),
+            &mut pending,
+            Duration::from_millis(20),
+        );
+
+        assert_eq!(pending, b"terminal tail");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded drain took {:?}",
+            started.elapsed()
+        );
+        drop(read_fd);
     }
 
     #[test]

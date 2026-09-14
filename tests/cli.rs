@@ -198,6 +198,44 @@ fn malformed_clients_are_disconnected_without_stopping_daemon() {
 }
 
 #[test]
+fn write_explains_rejected_protocol_to_older_sessions() {
+    let test = RiftTest::new();
+    let socket = test.dir.join("old-write-daemon");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind old daemon socket");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept write client");
+        let (tag, _) = read_frame(&mut stream);
+        assert_eq!(tag, 28, "expected RunQuiet request");
+        // An older daemon rejects the unknown tag by closing its connection.
+    });
+
+    let mut child = test
+        .command()
+        .args(["write", "old-write-daemon", "/tmp/unused"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn write against old daemon");
+    child
+        .stdin
+        .take()
+        .expect("write stdin")
+        .write_all(b"contents")
+        .expect("send write contents");
+    let output = child.wait_with_output().expect("wait for write failure");
+    server.join().expect("join old daemon");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("created by an older rift version, restart the session and retry"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn rename_waits_for_daemon_result() {
     let test = RiftTest::new();
     assert!(test.output(&["new", "rename-source"]).status.success());
